@@ -3,22 +3,21 @@ import torch.nn.functional as F
 import numpy as np
 
 class ImageListDepthSorter:
-    """
-    Takes a list of cutout images (as output by ImpactImageBatchToImageList),
-    finds the median brightness of the non-black pixels (the person), and sorts the list.
-    """
+    DESCRIPTION = "Takes a list of cutout images (as output by ImpactImageBatchToImageList), finds the median brightness of the non-black pixels (the person), and sorts the list."
+    
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE",),
-                "order": (["descending (nearest first)", "ascending (farthest first)"],),
+                "images": ("IMAGE", {"tooltip": "A list of cropped images, typically from ImpactImageBatchToImageList."}),
+                "order": (["descending (nearest first)", "ascending (farthest first)"], {"tooltip": "Sort order. Descending puts the brightest (closest) objects first."}),
             },
         }
 
     INPUT_IS_LIST = True
     RETURN_TYPES = ("IMAGE",)
     OUTPUT_IS_LIST = (True,)
+    OUTPUT_TOOLTIPS = ("The sorted list of images.",)
     FUNCTION = "sort_images"
     CATEGORY = "Monolith"
 
@@ -45,22 +44,21 @@ class ImageListDepthSorter:
 
 
 class SEGSDepthSorter:
-    """
-    Directly processes Impact Pack SEGS alongside a depth map, 
-    calculating depth within the exact segmentation mask, sorting, and returning SEGS.
-    """
+    DESCRIPTION = "Directly processes Impact Pack SEGS alongside a depth map, calculating depth within the exact segmentation mask, sorting, and returning SEGS."
+
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-                        "segs": ("SEGS", ),
-                        "depth_map": ("IMAGE", ),
-                        "sort_method": (["median", "mean"],),
-                        "order": (["descending (nearest first)", "ascending (farthest first)"],),
+                        "segs": ("SEGS", {"tooltip": "The SEGS output from SegmDetectorSEGS (Impact Pack)."}),
+                        "depth_map": ("IMAGE", {"tooltip": "A depth map image (e.g. from DepthAnythingV2)."}),
+                        "sort_method": (["median", "mean"], {"tooltip": "How to calculate the depth value of the mask."}),
+                        "order": (["descending (nearest first)", "ascending (farthest first)"], {"tooltip": "Sort order. Descending puts the brightest (closest) objects first."}),
                      },
                 }
 
     RETURN_TYPES = ("SEGS", )
     RETURN_NAMES = ("sorted_SEGS", )
+    OUTPUT_TOOLTIPS = ("The sorted SEGS tuple, ready for further Impact Pack processing.",)
     FUNCTION = "doit"
     CATEGORY = "Monolith"
 
