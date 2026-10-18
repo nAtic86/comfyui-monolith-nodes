@@ -1,13 +1,3 @@
-from .nodes import SEGSDepthSorter, ImageListDepthSorter
+from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
-NODE_CLASS_MAPPINGS = {
-    "SEGSDepthSorter": SEGSDepthSorter,
-    "ImageListDepthSorter": ImageListDepthSorter,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "SEGSDepthSorter": "SEGS Depth Sorter",
-    "ImageListDepthSorter": "Image List Depth Sorter",
-}
-
-__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

@@ -1,0 +1,22 @@
+[project]
+name = "comfyui-monolith-nodes"
+description = "Monolith custom node suite for ComfyUI (depth sorting, SEGS utilities, safety fallback, FastFaceFusion)."
+version = "0.3.0"
+dependencies = [
+    "torch",
+    "numpy",
+    "transformers",
+    "torchvision",
+    "opencv-python",
+    "onnx",
+    "onnxruntime-gpu",
+    "scipy",
+]
+
+[project.urls]
+Repository = "https://github.com/nAtic86/comfyui-monolith-nodes"
+
+[tool.comfy]
+PublisherId = "natic86"
+DisplayName = "ComfyUI Monolith Nodes"
+Icon = ""
