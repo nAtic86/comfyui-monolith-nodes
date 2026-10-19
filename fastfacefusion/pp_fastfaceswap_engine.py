@@ -18,16 +18,16 @@ import atexit
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def _setup_nvidia_library_paths():
-    """Auto-detect and add NVIDIA pip package libraries to LD_LIBRARY_PATH (Linux)."""
+    """Auto-detect and add NVIDIA pip package libraries to LD_LIBRARY_PATH and preload via ctypes (Linux)."""
     if sys.platform != 'linux':
         return
     
-    # Find nvidia packages in user site-packages or system site-packages
+    import ctypes
     import site
     search_paths = site.getsitepackages() + [site.getusersitepackages()]
     
     nvidia_lib_dirs = []
-    nvidia_packages = ['cudnn', 'cuda_runtime', 'cublas', 'cufft', 'curand', 'cusparse']
+    nvidia_packages = ['cu13', 'cudnn', 'cuda_runtime', 'cublas', 'cufft', 'curand', 'cusparse', 'cusolver', 'nvjitlink']
     
     for sp in search_paths:
         nvidia_base = os.path.join(sp, 'nvidia')
@@ -37,19 +37,24 @@ def _setup_nvidia_library_paths():
                 if os.path.isdir(lib_dir):
                     nvidia_lib_dirs.append(lib_dir)
     
-    # WSL-specific: Add CUDA driver path if on WSL
     wsl_cuda_path = '/usr/lib/wsl/lib'
     if os.path.exists('/proc/version'):
         with open('/proc/version', 'r') as f:
             if 'microsoft' in f.read().lower() and os.path.isdir(wsl_cuda_path):
                 nvidia_lib_dirs.append(wsl_cuda_path)
-                print(f"[WSL] Detected WSL environment, added CUDA driver path", flush=True)
     
     if nvidia_lib_dirs:
         existing = os.environ.get('LD_LIBRARY_PATH', '')
         new_paths = ':'.join(nvidia_lib_dirs)
         os.environ['LD_LIBRARY_PATH'] = new_paths + ':' + existing if existing else new_paths
-        print(f"[NVIDIA] Added {len(nvidia_lib_dirs)} library paths to LD_LIBRARY_PATH", flush=True)
+        for lib_dir in nvidia_lib_dirs:
+            for so_name in ('libcudart.so.13', 'libcublasLt.so.13', 'libcublas.so.13', 'libcufft.so.12', 'libcurand.so.10', 'libcudnn.so.9'):
+                so_path = os.path.join(lib_dir, so_name)
+                if os.path.exists(so_path):
+                    try:
+                        ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
+                    except OSError:
+                        pass
 
 _setup_nvidia_library_paths()
 
@@ -243,19 +248,12 @@ class FastFaceSwapEngine:
         # Mask settings (facefusion-compatible)
         mask_blur: float = DEFAULT_MASK_BLUR,
         mask_padding: List[int] = None,
-        pixel_boost: str = None,
+        pixel_boost: str = "128x128",
         face_swapper_weight: float = 0.5,
+        face_selector_mode: str = "reference",
+        face_selector_order: str = "large-small",
+        reference_face_distance: float = 0.6,
     ):
-        """
-        Initialize the engine.
-        
-        Args:
-            swap_model: Which swap model to use (inswapper_128, simswap_256, etc.)
-            enhance_model: Which enhancer to use (gfpgan_1.4, gpen_bfr_2048)
-            execution_providers: ONNX execution providers ['cuda'] or ['cpu']
-            mask_blur: Edge blur amount 0.0-1.0 (default 0.3)
-            mask_padding: [top, right, bottom, left] as % (default [0,0,0,0])
-        """
         self.script_dir = _SCRIPT_DIR
         self.swap_model_name = swap_model
         self.enhance_model_name = enhance_model
@@ -267,6 +265,9 @@ class FastFaceSwapEngine:
         
         self.pixel_boost = pixel_boost
         self.face_swapper_weight = face_swapper_weight
+        self.face_selector_mode = face_selector_mode
+        self.face_selector_order = face_selector_order
+        self.reference_face_distance = reference_face_distance
         
         self.initialized = False
         self.session = None
@@ -287,7 +288,8 @@ class FastFaceSwapEngine:
         self._init_facefusion_state()
         
         # Import helpers
-        from facefusion.face_analyser import get_one_face, get_many_faces
+        from facefusion.face_analyser import get_one_face, get_many_faces, get_average_face
+        from facefusion.face_selector import sort_faces_by_order, find_match_faces
         from facefusion.face_helper import warp_face_by_face_landmark_5, paste_back
         from facefusion.execution import create_inference_providers
         from facefusion.pixel_boost import implode_pixel_boost, explode_pixel_boost
@@ -295,6 +297,9 @@ class FastFaceSwapEngine:
         
         self.get_one_face = get_one_face
         self.get_many_faces = get_many_faces
+        self.get_average_face = get_average_face
+        self.sort_faces_by_order = sort_faces_by_order
+        self.find_match_faces = find_match_faces
         self.warp_face = warp_face_by_face_landmark_5
         self.paste_back = paste_back
         self.read_image = read_static_image
@@ -304,7 +309,7 @@ class FastFaceSwapEngine:
         self.unpack_resolution = unpack_resolution
     
     def _init_facefusion_state(self):
-        """Initialize FaceFusion state manager with required config."""
+        """Initialize FaceFusion state manager with required config (Dune 3.0.1 defaults)."""
         from facefusion import state_manager
         state_manager.init_item('face_detector_model', 'yolo_face')
         state_manager.init_item('face_detector_size', FACE_DETECTOR_SIZE)
@@ -313,9 +318,14 @@ class FastFaceSwapEngine:
         state_manager.init_item('face_detector_margin', [0, 0, 0, 0])
         state_manager.init_item('face_landmarker_model', '2dfan4')
         state_manager.init_item('face_landmarker_score', FACE_LANDMARKER_SCORE)
+        state_manager.init_item('face_selector_mode', self.face_selector_mode)
+        state_manager.init_item('face_selector_order', self.face_selector_order)
+        state_manager.init_item('reference_face_position', 0)
+        state_manager.init_item('reference_face_distance', self.reference_face_distance)
+        state_manager.init_item('reference_frame_number', 0)
         state_manager.init_item('download_providers', ['huggingface', 'github'])
         state_manager.init_item('execution_providers', self.execution_providers)
-        state_manager.init_item('execution_thread_count', 1)
+        state_manager.init_item('execution_thread_count', 6)
         state_manager.init_item('execution_queue_count', 1)
         state_manager.init_item('execution_device_ids', [0])
         state_manager.init_item('face_swapper_model', self.swap_model_name)
@@ -490,39 +500,46 @@ class FastFaceSwapEngine:
         return converted, converted_norm
     
     def _prepare_source_embedding(self, source_face):
-        """Prepare source face embedding for swap based on model type."""
-        
+        """Prepare source face embedding for swap based on model type (FaceFusion 3.0.1 reference)."""
         if self.model_type == "inswapper":
-            # Inswapper: use model initializer matrix
             source_embedding = source_face.embedding.reshape((1, -1))
             source_embedding = numpy.dot(source_embedding, self.model_initializer) / numpy.linalg.norm(source_embedding)
             return source_embedding
         
         elif self.model_type == "hyperswap":
-            # Hyperswap: use embedding_norm directly
             if hasattr(source_face, 'embedding_norm'):
                 return source_face.embedding_norm.reshape((1, -1))
-            else:
-                # Fallback: normalize embedding ourselves
-                embedding = source_face.embedding.reshape((1, -1))
-                return embedding / numpy.linalg.norm(embedding)
+            embedding = source_face.embedding.reshape((1, -1))
+            return embedding / numpy.linalg.norm(embedding)
         
         elif self.model_type == "ghost":
-            # Ghost: convert embedding and use converted version
             source_embedding = source_face.embedding.reshape(-1, 512)
             converted, _ = self._convert_embedding(source_embedding)
             return converted.reshape(1, -1)
         
         elif self.model_type == "simswap":
-            # Simswap: convert embedding and use normalized version
             source_embedding = source_face.embedding.reshape(-1, 512)
             _, converted_norm = self._convert_embedding(source_embedding)
             return converted_norm.reshape(1, -1)
         
         else:
-            # Default: simple normalization
             source_embedding = source_face.embedding.reshape((1, -1))
             return source_embedding / numpy.linalg.norm(source_embedding)
+
+    def select_target_faces(self, faces: List[Any], reference_face: Optional[Any] = None) -> List[Any]:
+        """Sort and filter target faces according to FaceFusion 3.0.1 face_selector rules."""
+        if not faces:
+            return []
+        ordered = self.sort_faces_by_order(faces, self.face_selector_order) if self.face_selector_order else faces
+        if self.face_selector_mode == "one":
+            one = self.get_one_face(ordered, 0)
+            return [one] if one else []
+        if self.face_selector_mode == "reference":
+            ref = reference_face if reference_face is not None else self.get_one_face(ordered, 0)
+            if ref is not None:
+                return self.find_match_faces([ref], ordered, self.reference_face_distance)
+            return []
+        return ordered
     
     def _prepare_crop_frame(self, crop_vision_frame):
         """Prepare cropped frame for model input."""
@@ -542,8 +559,6 @@ class FastFaceSwapEngine:
         
         crop_vision_frame = crop_vision_frame.transpose(1, 2, 0)
         
-        # Only these model types need inverse normalization
-        # NOTE: simswap is NOT included (per facefusion reference)
         if self.model_type in ["ghost", "hyperswap", "hififace", "uniface"]:
             crop_vision_frame = crop_vision_frame * std + mean
         
@@ -552,13 +567,12 @@ class FastFaceSwapEngine:
         return crop_vision_frame
     
     def _forward_enhancer(self, crop_frame):
-        """Run enhancer inference on a 512x512 crop."""
+        """Run enhancer inference on a 512x512 crop matching FaceFusion 3.0.1 face_enhancer.py."""
         enhance_size = self.enhancer_info.get("size", (512, 512))
         input_frame = cv2.resize(crop_frame, enhance_size) if crop_frame.shape[:2] != (enhance_size[1], enhance_size[0]) else crop_frame
         input_frame = input_frame[:, :, ::-1] / 255.0
         input_frame = (input_frame - 0.5) / 0.5
-        input_frame = input_frame.transpose(2, 0, 1)
-        input_frame = numpy.expand_dims(input_frame, axis=0).astype(numpy.float32)
+        input_frame = numpy.expand_dims(input_frame.transpose(2, 0, 1), axis=0).astype(numpy.float32)
         
         inputs = {self.enhancer_session.get_inputs()[0].name: input_frame}
         for inp in self.enhancer_session.get_inputs():
@@ -567,13 +581,14 @@ class FastFaceSwapEngine:
                 
         output = self.enhancer_session.run(None, inputs)[0][0]
         
+        output = numpy.clip(output, -1, 1)
+        output = (output + 1) / 2
         output = output.transpose(1, 2, 0)
-        output = (output * 0.5 + 0.5) * 255.0
-        output = output.clip(0, 255).astype(numpy.uint8)
-        output = output[:, :, ::-1]
+        output = (output * 255.0).round()
+        output = output.astype(numpy.uint8)[:, :, ::-1]
         return output
 
-    def enhance_face(self, crop_frame, blend: int = 100):
+    def enhance_face(self, crop_frame, blend: int = 80):
         """
         Apply face enhancement directly on a cropped frame.
         Maintains full enhancer resolution (no downsampling to model_size).
@@ -597,23 +612,18 @@ class FastFaceSwapEngine:
         frame, 
         target_faces=None,
         enhance: bool = True,
-        enhancer_blend: int = 100,
+        enhancer_blend: int = 80,
+        reference_face: Optional[Any] = None,
     ):
         """
-        Process a single frame.
-        
-        Args:
-            source_embedding: Pre-computed source face embedding
-            frame: Target video frame
-            target_faces: Pre-detected faces (optional, for caching)
-            enhance: Whether to apply enhancement
-            enhancer_blend: Enhancement blend percentage
+        Process a single frame matching FaceFusion 3.0.1 execution steps.
         """
         if target_faces is None:
-            faces = self.get_many_faces([frame])
+            raw_faces = self.get_many_faces([frame])
         else:
-            faces = target_faces
+            raw_faces = target_faces
         
+        faces = self.select_target_faces(raw_faces, reference_face=reference_face)
         if not faces:
             return frame
         
@@ -622,14 +632,15 @@ class FastFaceSwapEngine:
         model_template = self.model_info.get("template", "arcface_128")
         
         for target_face in faces:
-            # Blending Source and Target Embeddings with face_swapper_weight
-            weight = numpy.interp(self.face_swapper_weight, [0, 1], [0.35, -0.35]).astype(numpy.float32)
-            
-            target_embedding = target_face.embedding
-            if self.model_info.get("type") in ["hififace", "hyperswap", "inswapper", "simswap"]:
-                target_embedding = target_embedding / numpy.linalg.norm(target_embedding)
-                
-            blended_embedding = source_embedding.reshape(1, -1) * (1 - weight) + target_embedding.reshape(1, -1) * weight
+            # FaceFusion 3.0.1 uses pure source_embedding for inswapper (weight == 0 when face_swapper_weight == 0.5)
+            if abs(self.face_swapper_weight - 0.5) < 1e-4 or self.model_type == "inswapper":
+                blended_embedding = source_embedding.reshape(1, -1).astype(numpy.float32)
+            else:
+                weight = numpy.interp(self.face_swapper_weight, [0, 1], [0.35, -0.35]).astype(numpy.float32)
+                target_embedding = target_face.embedding
+                if self.model_info.get("type") in ["hififace", "hyperswap", "simswap"]:
+                    target_embedding = target_embedding / numpy.linalg.norm(target_embedding)
+                blended_embedding = (source_embedding.reshape(1, -1) * (1 - weight) + target_embedding.reshape(1, -1) * weight).astype(numpy.float32)
             
             # Pixel Boost sizing
             if self.pixel_boost and self.pixel_boost != "none":
@@ -694,10 +705,10 @@ class FastFaceSwapEngine:
             # 7. Paste back swapped face
             temp_frame = self.paste_back(temp_frame, result_crop_frame, mask, affine_matrix)
         
-        # 8. Face Enhancement pass (FaceFusion-compatible: 512x512 resolution + post-paste blend)
+        # 8. Face Enhancement pass (FaceFusion 3.0.1 face_enhancer.py: (0,0,0,0) box mask padding + post-paste blend)
         if enhance and self.enhancer_session and enhancer_blend > 0:
             for target_face in faces:
-                unenhanced_frame = temp_frame.copy() if enhancer_blend < 100 else None
+                unenhanced_frame = temp_frame.copy()
                 
                 enhance_size = self.enhancer_info.get("size", (512, 512))
                 enhance_template = self.enhancer_info.get("template", "ffhq_512")
@@ -712,34 +723,19 @@ class FastFaceSwapEngine:
                 enhanced_crop = self._forward_enhancer(enhance_crop)
                 
                 enhance_crop_size = (enhance_size[1], enhance_size[0])
-                enhance_box_mask = create_box_mask(enhance_crop_size, self.mask_blur, self.mask_padding)
+                enhance_box_mask = create_box_mask(enhance_crop_size, self.mask_blur, [0, 0, 0, 0])
                 enhance_mask = numpy.expand_dims(enhance_box_mask, axis=-1)
                 
                 paste_vision_frame = self.paste_back(temp_frame, enhanced_crop, enhance_mask, enhance_affine_matrix)
                 
-                if unenhanced_frame is not None:
-                    alpha = enhancer_blend / 100.0
-                    temp_frame = cv2.addWeighted(unenhanced_frame, 1.0 - alpha, paste_vision_frame, alpha, 0)
-                else:
-                    temp_frame = paste_vision_frame
+                face_enhancer_blend = 1.0 - (enhancer_blend / 100.0)
+                temp_frame = cv2.addWeighted(unenhanced_frame, face_enhancer_blend, paste_vision_frame, 1.0 - face_enhancer_blend, 0)
         
         return temp_frame
     
     def analyze_video(self, target_path: str) -> List[Tuple[int, Any]]:
         """
         Analyze video and cache face detections.
-        
-        Note on Cache Formats:
-        - This engine uses `.faces.pkl` (Python pickle) as the runtime cache because 
-          it preserves the full Face objects with numpy arrays and is optimized for speed.
-        - The `extract_landmarks.py` utility generates `.json` sidecars, which are intended 
-          as human-readable inspection tools. The engine does NOT consume the JSON sidecars.
-        
-        Args:
-            target_path: Path to target video
-            
-        Returns:
-            List of (frame_index, faces) tuples
         """
         cache_path = target_path + '.faces.pkl'
         
@@ -755,7 +751,7 @@ class FastFaceSwapEngine:
         
         log(f"Analyzing target video: {os.path.basename(target_path)}")
         cap = cv2.VideoCapture(target_path)
-        _active_captures.append(cap)  # Register for cleanup
+        _active_captures.append(cap)
         
         face_data = []
         frame_idx = 0
@@ -782,7 +778,7 @@ class FastFaceSwapEngine:
                 pct = frame_idx * 100 // total_frames
                 print(f"\r[Analyzing] {frame_idx}/{total_frames} ({pct}%) - {fps:.1f} fps - {faces_found} faces found", end='', flush=True)
         
-        print()  # newline after progress
+        print()
         cap.release()
         if cap in _active_captures:
             _active_captures.remove(cap)
@@ -800,16 +796,6 @@ class FastFaceSwapEngine:
         return face_data
     
     def _generate_thumbnail(self, video_path: str, timestamp: float = 0.5) -> Optional[str]:
-        """
-        Generate thumbnail from video.
-        
-        Args:
-            video_path: Path to video
-            timestamp: Time in seconds to extract frame
-            
-        Returns:
-            Path to thumbnail or None
-        """
         thumb_path = os.path.splitext(video_path)[0] + '.png'
         
         try:
@@ -836,36 +822,18 @@ class FastFaceSwapEngine:
         source: Any,
         target_path: str,
         output_path: str,
-        # Quality parameters
-        video_quality: int = 21,
+        # Quality parameters (Dune 3.0.1 defaults: output_video_quality=80 -> cq 10, veryfast)
+        video_quality: int = 10,
         use_gpu_encode: bool = True,
         # Enhancement parameters
         enhance: bool = True,
-        enhancer_blend: int = 100,
+        enhancer_blend: int = 80,
         # Output options
         generate_thumbnail: bool = True,
         # Testing options
         max_frames: int = 0,
         progress_callback: Optional[Any] = None,
     ) -> Tuple[bool, Optional[str]]:
-        """
-        Process video with face swap.
-        
-        Args:
-            source: Path to source image, BGR numpy array, or precomputed embedding
-            target_path: Path to target video
-            output_path: Path for output video
-            video_quality: CRF value (lower = better, 18-28 typical)
-            use_gpu_encode: Use NVENC if available
-            enhance: Apply face enhancement
-            enhancer_blend: Enhancement blend percentage (0-100)
-            generate_thumbnail: Generate PNG thumbnail
-            max_frames: Max frames to process (0 = all)
-            progress_callback: Optional callback(current_frame, total_frames)
-            
-        Returns:
-            Tuple of (success, error_message)
-        """
         if not self.initialized:
             if not self.pre_check():
                 return False, "Engine initialization failed"
@@ -873,7 +841,6 @@ class FastFaceSwapEngine:
         if not os.path.exists(target_path):
             return False, f"Target not found: {target_path}"
         
-        # Ensure output directory exists
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         
         process = None
@@ -884,8 +851,8 @@ class FastFaceSwapEngine:
             if isinstance(source, numpy.ndarray) and source.ndim in (1, 2) and source.shape[-1] == 512:
                 source_embedding = source
             elif isinstance(source, numpy.ndarray) and source.ndim == 3:
-                source_faces = self.get_many_faces([source])
-                source_face = self.get_one_face(source_faces)
+                source_faces = self.sort_faces_by_order(self.get_many_faces([source]), self.face_selector_order)
+                source_face = self.get_average_face(source_faces)
                 if not source_face:
                     return False, "No face found in source image"
                 source_embedding = self._prepare_source_embedding(source_face)
@@ -894,8 +861,8 @@ class FastFaceSwapEngine:
                     return False, f"Source not found: {source}"
                 log(f"Source: {os.path.basename(source)}")
                 src_frame = self.read_image(source)
-                source_faces = self.get_many_faces([src_frame])
-                source_face = self.get_one_face(source_faces)
+                source_faces = self.sort_faces_by_order(self.get_many_faces([src_frame]), self.face_selector_order)
+                source_face = self.get_average_face(source_faces)
                 if not source_face:
                     return False, "No face found in source image"
                 log("Source face detected, preparing embedding...")
@@ -906,6 +873,16 @@ class FastFaceSwapEngine:
             # 2. Analyze target (cached)
             video_face_data = self.analyze_video(target_path)
             video_face_map = {k: v for k, v in video_face_data}
+            
+            # Extract reference face from reference_frame_number (frame 0, largest face per Dune 3.0.1)
+            reference_face = None
+            if self.face_selector_mode == "reference":
+                ref_frame_faces = video_face_map.get(0)
+                if not ref_frame_faces and video_face_data:
+                    ref_frame_faces = video_face_data[0][1]
+                if ref_frame_faces:
+                    ordered_ref = self.sort_faces_by_order(ref_frame_faces, self.face_selector_order)
+                    reference_face = self.get_one_face(ordered_ref, 0)
             
             # 3. Setup video capture
             log(f"Opening target video: {os.path.basename(target_path)}")
@@ -919,7 +896,7 @@ class FastFaceSwapEngine:
             
             log(f"Video: {width}x{height} @ {fps:.1f}fps, {total_frames} frames")
             
-            # 4. Setup FFmpeg
+            # 4. Setup FFmpeg (Dune 3.0.1: h264_nvenc, preset veryfast)
             use_nvenc = use_gpu_encode and self.nvenc_available
             encoder = 'h264_nvenc' if use_nvenc else 'libx264'
             quality_param = '-cq' if use_nvenc else '-crf'
@@ -934,7 +911,7 @@ class FastFaceSwapEngine:
                 '-i', '-',
                 '-i', target_path,
                 '-c:v', encoder,
-                '-preset', 'fast',
+                '-preset', 'veryfast',
                 quality_param, str(video_quality),
                 '-pix_fmt', 'yuv420p',
                 '-c:a', 'aac',
@@ -977,6 +954,7 @@ class FastFaceSwapEngine:
                     target_faces,
                     enhance=enhance,
                     enhancer_blend=enhancer_blend,
+                    reference_face=reference_face,
                 )
                 
                 process.stdin.write(result_frame.tobytes())

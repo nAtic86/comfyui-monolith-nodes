@@ -323,8 +323,8 @@ MODEL_REGISTRY: Dict[str, Dict] = {
     },
 }
 
-# Default models to use
-DEFAULT_SWAP_MODEL = "inswapper_128"  # Best quality
+# Default models to use (Dune 3.0.1 baseline)
+DEFAULT_SWAP_MODEL = "inswapper_128_fp16"
 DEFAULT_ENHANCE_MODEL = "gfpgan_1.4"
 
 # Required models that must always be present
