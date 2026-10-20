@@ -45,3 +45,4 @@ comfyui-monolith-nodes/
 
 ### `Monolith/Prompt`
 - **Monolith Prompt Switch By Image (`MonolithPromptSwitchByImage`)**: Walks upstream from an `IMAGE` input wire to resolve the source filename (e.g. from `LoadImage`) and outputs the prompt matching `[filename.png]`, `[stem]`, or `[default]`.
+- **Monolith Image Switch By Image (`MonolithImageSwitchByImage`)**: Patch-bay image router using native ComfyUI V3 `Autogrow` slots (`image1..N` and `image1_output..N_output`). Matches the input image against connected candidate images by upstream filename (with pixel-tensor fallback) and outputs `(IMAGE, MASK, detected_filename)` for the winning `imageN_output` (or `default_image`), automatically extracting the upstream `LoadImage` alpha mask without extra mask inputs.
