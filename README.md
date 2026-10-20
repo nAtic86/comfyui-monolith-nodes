@@ -19,7 +19,8 @@ comfyui-monolith-nodes/
     ├── __init__.py             # Merges domain NODE_CLASS_MAPPINGS
     ├── depth.py                # Monolith/Depth nodes
     ├── safety.py               # Monolith/Safety nodes
-    └── faceswap.py             # Monolith/FaceSwap nodes
+    ├── faceswap.py             # Monolith/FaceSwap nodes
+    └── prompt.py               # Monolith/Prompt nodes
 ```
 
 ### Adding a New Node Domain
@@ -41,3 +42,6 @@ comfyui-monolith-nodes/
 - **Monolith Face Boost (`MonolithFaceBoost`)**: Pre-cursor enhancer/restoration config node that feeds into `MonolithFaceSwap`.
 - **Monolith FaceSwap (`MonolithFaceSwap`)**: Swaps a source face onto a target image, target video, or both in a single pass with mask padding presets and NVENC support.
 - **Monolith Face Enhancer (`MonolithFaceEnhancer`)**: Standalone face restoration node for static images.
+
+### `Monolith/Prompt`
+- **Monolith Prompt Switch By Image (`MonolithPromptSwitchByImage`)**: Walks upstream from an `IMAGE` input wire to resolve the source filename (e.g. from `LoadImage`) and outputs the prompt matching `[filename.png]`, `[stem]`, or `[default]`.
