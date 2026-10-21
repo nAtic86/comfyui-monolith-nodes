@@ -896,13 +896,15 @@ class FastFaceSwapEngine:
             
             log(f"Video: {width}x{height} @ {fps:.1f}fps, {total_frames} frames")
             
-            # 4. Setup FFmpeg (Dune 3.0.1: h264_nvenc, preset veryfast)
+            # 4. Setup FFmpeg
             use_nvenc = use_gpu_encode and self.nvenc_available
             encoder = 'h264_nvenc' if use_nvenc else 'libx264'
+            preset = 'fast' if use_nvenc else 'veryfast'
             quality_param = '-cq' if use_nvenc else '-crf'
             
             ffmpeg_cmd = [
                 'ffmpeg', '-y',
+                '-loglevel', 'error',
                 '-f', 'rawvideo',
                 '-vcodec', 'rawvideo',
                 '-s', f'{width}x{height}',
@@ -911,13 +913,14 @@ class FastFaceSwapEngine:
                 '-i', '-',
                 '-i', target_path,
                 '-c:v', encoder,
-                '-preset', 'veryfast',
+                '-preset', preset,
                 quality_param, str(video_quality),
                 '-pix_fmt', 'yuv420p',
                 '-c:a', 'aac',
                 '-map', '0:v:0',
                 '-map', '1:a:0?',
                 '-shortest',
+                '-movflags', '+faststart',
                 output_path
             ]
             
@@ -984,8 +987,10 @@ class FastFaceSwapEngine:
             try:
                 # Give FFmpeg up to 120s to finish encoding
                 returncode = process.wait(timeout=120)
+                stderr_text = process.stderr.read().decode('utf-8', errors='replace').strip() if process.stderr else ''
                 if returncode != 0:
-                    log(f"FFmpeg error (code {returncode})", "ERROR")
+                    log(f"FFmpeg error (code {returncode}): {stderr_text}", "ERROR")
+                    return False, f"FFmpeg error (code {returncode}): {stderr_text}"
             except subprocess.TimeoutExpired:
                 process.kill()
                 log("FFmpeg killed after 120s timeout", "ERROR")
@@ -1006,8 +1011,19 @@ class FastFaceSwapEngine:
             return True, None
             
         except BrokenPipeError:
-            log("FFmpeg pipe broken!", "ERROR")
-            return False, "FFmpeg pipe broken"
+            stderr_text = ""
+            if process is not None and process.stderr is not None:
+                try:
+                    process.wait(timeout=2)
+                except Exception:
+                    pass
+                try:
+                    stderr_text = process.stderr.read().decode('utf-8', errors='replace').strip()
+                except Exception:
+                    pass
+            detail = f": {stderr_text}" if stderr_text else ""
+            log(f"FFmpeg pipe broken!{detail}", "ERROR")
+            return False, f"FFmpeg pipe broken{detail}"
         except subprocess.TimeoutExpired:
             log("FFmpeg timed out!", "ERROR")
             return False, "FFmpeg encoding timed out"
@@ -1037,6 +1053,98 @@ class FastFaceSwapEngine:
                         process.kill()
                     except:
                         pass
+
+    def process_video_frames(
+        self,
+        source: Any,
+        target_path: str,
+        enhance: bool = True,
+        enhancer_blend: int = 80,
+        max_frames: int = 0,
+        progress_callback: Optional[Any] = None,
+    ) -> Tuple[Optional[List[numpy.ndarray]], float, Optional[str]]:
+        if not self.initialized:
+            if not self.pre_check():
+                return None, 0.0, "Engine initialization failed"
+
+        if not os.path.exists(target_path):
+            return None, 0.0, f"Target not found: {target_path}"
+
+        cap = None
+        try:
+            if isinstance(source, numpy.ndarray) and source.ndim in (1, 2) and source.shape[-1] == 512:
+                source_embedding = source
+            elif isinstance(source, numpy.ndarray) and source.ndim == 3:
+                source_faces = self.sort_faces_by_order(self.get_many_faces([source]), self.face_selector_order)
+                source_face = self.get_average_face(source_faces)
+                if not source_face:
+                    return None, 0.0, "No face found in source image"
+                source_embedding = self._prepare_source_embedding(source_face)
+            elif isinstance(source, str):
+                if not os.path.exists(source):
+                    return None, 0.0, f"Source not found: {source}"
+                src_frame = self.read_image(source)
+                source_faces = self.sort_faces_by_order(self.get_many_faces([src_frame]), self.face_selector_order)
+                source_face = self.get_average_face(source_faces)
+                if not source_face:
+                    return None, 0.0, "No face found in source image"
+                source_embedding = self._prepare_source_embedding(source_face)
+            else:
+                return None, 0.0, f"Unsupported source type: {type(source)}"
+
+            video_face_data = self.analyze_video(target_path)
+            video_face_map = {k: v for k, v in video_face_data}
+
+            reference_face = None
+            if self.face_selector_mode == "reference":
+                ref_frame_faces = video_face_map.get(0)
+                if not ref_frame_faces and video_face_data:
+                    ref_frame_faces = video_face_data[0][1]
+                if ref_frame_faces:
+                    ordered_ref = self.sort_faces_by_order(ref_frame_faces, self.face_selector_order)
+                    reference_face = self.get_one_face(ordered_ref, 0)
+
+            cap = cv2.VideoCapture(target_path)
+            _active_captures.append(cap)
+
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+            rgb_frames: List[numpy.ndarray] = []
+            frame_idx = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if max_frames > 0 and frame_idx >= max_frames:
+                    break
+
+                target_faces = video_face_map.get(frame_idx, [])
+                result_frame = self.process_frame(
+                    source_embedding,
+                    frame,
+                    target_faces,
+                    enhance=enhance,
+                    enhancer_blend=enhancer_blend,
+                    reference_face=reference_face,
+                )
+                rgb_frames.append(cv2.cvtColor(result_frame, cv2.COLOR_BGR2RGB))
+                frame_idx += 1
+                if progress_callback is not None:
+                    progress_callback(frame_idx, total_frames)
+
+            return rgb_frames, fps, None
+        except Exception as e:
+            log(f"Processing frames error: {e}", "ERROR")
+            return None, 0.0, str(e)
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                    if cap in _active_captures:
+                        _active_captures.remove(cap)
+                except Exception:
+                    pass
 
 
 # Singleton engine for worker_core integration

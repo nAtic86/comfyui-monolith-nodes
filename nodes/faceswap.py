@@ -1,3 +1,5 @@
+from fractions import Fraction
+import itertools
 import os
 from typing import Any, Dict, List, Optional
 import numpy as np
@@ -13,7 +15,7 @@ from ..fastfacefusion.pp_fastfaceswap_models import (
 )
 
 try:
-    from comfy_api.latest import InputImpl
+    from comfy_api.latest import InputImpl, Types
 except ImportError:
     class DummyVideo:
         def __init__(self, path: str):
@@ -23,6 +25,31 @@ except ImportError:
             return self.path
 
     InputImpl = type("InputImpl", (), {"VideoFromFile": DummyVideo})
+    Types = None
+
+
+def _extract_audio_from_file(video_path: str) -> Optional[Dict[str, Any]]:
+    try:
+        import av
+        with av.open(video_path, mode="r") as container:
+            audio_streams = [s for s in container.streams if s.type == "audio"]
+            if not audio_streams:
+                return None
+            audio_stream = audio_streams[0]
+            resampler = av.audio.resampler.AudioResampler(format="fltp")
+            audio_frames = []
+            for packet in container.demux(audio_stream):
+                for frame in itertools.chain.from_iterable(map(resampler.resample, packet.decode())):
+                    audio_frames.append(frame.to_ndarray())
+            if not audio_frames:
+                return None
+            audio_data = np.concatenate(audio_frames, axis=1)
+            return {
+                "waveform": torch.from_numpy(audio_data).unsqueeze(0),
+                "sample_rate": int(audio_stream.sample_rate) if audio_stream.sample_rate else 44100,
+            }
+    except Exception:
+        return None
 
 
 def _get_engine_cls():
@@ -147,6 +174,8 @@ class MonolithFaceSwap:
                 "mask_padding_bottom": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
                 "mask_padding_left": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
                 "mask_padding_right": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
+                "save_video": ("BOOLEAN", {"default": False}),
+                "filename_prefix": ("STRING", {"default": "video/ComfyUI"}),
                 "video_quality": ("INT", {"default": 10, "min": 1, "max": 51, "step": 1}),
                 "use_gpu_encode": ("BOOLEAN", {"default": True}),
                 "max_video_frames": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 10}),
@@ -182,6 +211,8 @@ class MonolithFaceSwap:
         mask_padding_bottom: int = 0,
         mask_padding_left: int = 0,
         mask_padding_right: int = 0,
+        save_video: bool = False,
+        filename_prefix: str = "video/ComfyUI",
         video_quality: int = 10,
         use_gpu_encode: bool = True,
         max_video_frames: int = 0,
@@ -251,7 +282,12 @@ class MonolithFaceSwap:
                 actual_target_image = img_tensor
 
         video_input_path: Optional[str] = None
-        if target_video is not None:
+        is_comp_video = (
+            target_video is not None
+            and hasattr(InputImpl, "VideoFromComponents")
+            and isinstance(target_video, InputImpl.VideoFromComponents)
+        )
+        if target_video is not None and not is_comp_video:
             if hasattr(target_video, "get_stream_source"):
                 src = target_video.get_stream_source()
                 if isinstance(src, str) and os.path.exists(src):
@@ -268,8 +304,16 @@ class MonolithFaceSwap:
             if candidate.startswith(input_dir + os.sep) and os.path.exists(candidate):
                 video_input_path = candidate
 
-        if actual_target_image is None and not video_input_path:
+        has_component_video = (
+            video_input_path is None
+            and is_comp_video
+            and hasattr(target_video, "get_components")
+        )
+
+        if actual_target_image is None and not video_input_path and not has_component_video:
             raise ValueError("MonolithFaceSwap: Please provide either a target_image or target_video (or select from dropdowns).")
+
+        do_enhance = engine.enhance_model_name is not None and actual_enhancer_blend > 0
 
         if actual_target_image is not None:
             out_frames = []
@@ -282,7 +326,7 @@ class MonolithFaceSwap:
                 result_bgr = engine.process_frame(
                     source_embedding=source_embedding,
                     frame=frame_bgr,
-                    enhance=(engine.enhance_model_name is not None and actual_enhancer_blend > 0),
+                    enhance=do_enhance,
                     enhancer_blend=actual_enhancer_blend,
                     reference_face=ref_face_img,
                 )
@@ -298,11 +342,6 @@ class MonolithFaceSwap:
             ui_images.append({"filename": preview_fn, "subfolder": subf, "type": "temp"})
 
         if video_input_path:
-            full_out_dir, base_fn, counter, subf, _ = folder_paths.get_save_image_path("monolith_faceswap_video", folder_paths.get_output_directory())
-            os.makedirs(full_out_dir, exist_ok=True)
-            out_video_fn = f"{base_fn}_{counter:05}_.mp4"
-            out_video_path = os.path.join(full_out_dir, out_video_fn)
-
             cap = cv2.VideoCapture(video_input_path)
             total_vid_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             cap.release()
@@ -312,33 +351,116 @@ class MonolithFaceSwap:
             def pbar_update(curr, tot):
                 pbar.update(1)
 
-            ok, err = engine.process_video(
-                source=source_embedding,
-                target_path=video_input_path,
-                output_path=out_video_path,
-                video_quality=video_quality,
-                use_gpu_encode=use_gpu_encode,
-                enhance=(engine.enhance_model_name is not None and actual_enhancer_blend > 0),
-                enhancer_blend=actual_enhancer_blend,
-                generate_thumbnail=True,
-                max_frames=max_video_frames,
-                progress_callback=pbar_update,
-            )
+            if save_video:
+                prefix = (filename_prefix or "video/ComfyUI").strip() or "video/ComfyUI"
+                full_out_dir, base_fn, counter, subf, _ = folder_paths.get_save_image_path(prefix, folder_paths.get_output_directory())
+                os.makedirs(full_out_dir, exist_ok=True)
+                out_video_fn = f"{base_fn}_{counter:05}_.mp4"
+                out_video_path = os.path.join(full_out_dir, out_video_fn)
 
-            if not ok:
-                raise RuntimeError(f"MonolithFaceSwap video processing failed: {err}")
+                ok, err = engine.process_video(
+                    source=source_embedding,
+                    target_path=video_input_path,
+                    output_path=out_video_path,
+                    video_quality=video_quality,
+                    use_gpu_encode=use_gpu_encode,
+                    enhance=do_enhance,
+                    enhancer_blend=actual_enhancer_blend,
+                    generate_thumbnail=True,
+                    max_frames=max_video_frames,
+                    progress_callback=pbar_update,
+                )
 
-            out_video = InputImpl.VideoFromFile(out_video_path)
-            ui_videos.append({"filename": out_video_fn, "subfolder": subf, "type": "output"})
+                if not ok:
+                    raise RuntimeError(f"MonolithFaceSwap video processing failed: {err}")
 
+                out_video = InputImpl.VideoFromFile(out_video_path)
+                ui_videos.append({"filename": out_video_fn, "subfolder": subf, "type": "output"})
+
+                if out_image is None:
+                    thumb_path = os.path.splitext(out_video_path)[0] + ".png"
+                    if os.path.exists(thumb_path):
+                        thumb_bgr = cv2.imread(thumb_path)
+                        thumb_rgb = cv2.cvtColor(thumb_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                        out_image = torch.from_numpy(thumb_rgb).unsqueeze(0)
+                    else:
+                        out_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            else:
+                rgb_frames, fps, err = engine.process_video_frames(
+                    source=source_embedding,
+                    target_path=video_input_path,
+                    enhance=do_enhance,
+                    enhancer_blend=actual_enhancer_blend,
+                    max_frames=max_video_frames,
+                    progress_callback=pbar_update,
+                )
+                if rgb_frames is None or len(rgb_frames) == 0:
+                    raise RuntimeError(f"MonolithFaceSwap video frame processing failed: {err or 'No frames decoded'}")
+
+                frames_tensor = torch.from_numpy(np.stack(rgb_frames, axis=0)).to(dtype=torch.float32).div_(255.0)
+                if out_image is None:
+                    out_image = frames_tensor
+
+                mid_rgb = rgb_frames[len(rgb_frames) // 2]
+                full_out_dir, base_fn, counter, subf, _ = folder_paths.get_save_image_path("monolith_faceswap_preview", folder_paths.get_temp_directory())
+                os.makedirs(full_out_dir, exist_ok=True)
+                preview_fn = f"{base_fn}_{counter:05}_.png"
+                Image.fromarray(mid_rgb).save(os.path.join(full_out_dir, preview_fn))
+                ui_images.append({"filename": preview_fn, "subfolder": subf, "type": "temp"})
+
+                if Types is not None and hasattr(InputImpl, "VideoFromComponents"):
+                    audio_dict = _extract_audio_from_file(video_input_path)
+                    fps_frac = Fraction(max(1, round(fps * 1000)), 1000)
+                    out_video = InputImpl.VideoFromComponents(
+                        Types.VideoComponents(images=frames_tensor, audio=audio_dict, frame_rate=fps_frac)
+                    )
+        elif has_component_video:
+            comp = target_video.get_components()
+            vid_images = comp.images
+            limit = vid_images.shape[0] if (max_video_frames == 0 or max_video_frames > vid_images.shape[0]) else max_video_frames
+            pbar = comfy.utils.ProgressBar(limit)
+            swapped_rgb = []
+            ref_face_vid = None
+            for i in range(limit):
+                frame_bgr = (vid_images[i].cpu().numpy() * 255.0).astype(np.uint8)[:, :, ::-1]
+                if i == 0 and engine.face_selector_mode == "reference":
+                    f0_faces = engine.sort_faces_by_order(engine.get_many_faces([frame_bgr]), engine.face_selector_order)
+                    ref_face_vid = engine.get_one_face(f0_faces, 0)
+                result_bgr = engine.process_frame(
+                    source_embedding=source_embedding,
+                    frame=frame_bgr,
+                    enhance=do_enhance,
+                    enhancer_blend=actual_enhancer_blend,
+                    reference_face=ref_face_vid,
+                )
+                swapped_rgb.append(cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB))
+                pbar.update(1)
+
+            frames_tensor = torch.from_numpy(np.stack(swapped_rgb, axis=0)).to(dtype=torch.float32).div_(255.0)
             if out_image is None:
-                thumb_path = os.path.splitext(out_video_path)[0] + ".png"
-                if os.path.exists(thumb_path):
-                    thumb_bgr = cv2.imread(thumb_path)
-                    thumb_rgb = cv2.cvtColor(thumb_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-                    out_image = torch.from_numpy(thumb_rgb).unsqueeze(0)
+                out_image = frames_tensor
+
+            if Types is not None and hasattr(InputImpl, "VideoFromComponents"):
+                comp_video = InputImpl.VideoFromComponents(
+                    Types.VideoComponents(images=frames_tensor, audio=comp.audio, frame_rate=comp.frame_rate)
+                )
+                if save_video:
+                    prefix = (filename_prefix or "video/ComfyUI").strip() or "video/ComfyUI"
+                    full_out_dir, base_fn, counter, subf, _ = folder_paths.get_save_image_path(prefix, folder_paths.get_output_directory())
+                    os.makedirs(full_out_dir, exist_ok=True)
+                    out_video_fn = f"{base_fn}_{counter:05}_.mp4"
+                    out_video_path = os.path.join(full_out_dir, out_video_fn)
+                    comp_video.save_to(out_video_path)
+                    out_video = InputImpl.VideoFromFile(out_video_path)
+                    ui_videos.append({"filename": out_video_fn, "subfolder": subf, "type": "output"})
                 else:
-                    out_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+                    out_video = comp_video
+                    mid_rgb = swapped_rgb[len(swapped_rgb) // 2]
+                    full_out_dir, base_fn, counter, subf, _ = folder_paths.get_save_image_path("monolith_faceswap_preview", folder_paths.get_temp_directory())
+                    os.makedirs(full_out_dir, exist_ok=True)
+                    preview_fn = f"{base_fn}_{counter:05}_.png"
+                    Image.fromarray(mid_rgb).save(os.path.join(full_out_dir, preview_fn))
+                    ui_images.append({"filename": preview_fn, "subfolder": subf, "type": "temp"})
 
         if out_image is None:
             out_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)

@@ -13,98 +13,124 @@ function getWidgetValue(node, widgetName, fallback) {
     return w && w.value !== undefined ? w.value : fallback;
 }
 
-function getLiveTimelineState(node) {
-    const executed = node._monolithNleMeta;
-    const stillDur = parseFloat(getWidgetValue(node, "still_duration", 4.0)) || 4.0;
-    const endcardWidgetDur = parseFloat(getWidgetValue(node, "endcard_duration", 4.0)) || 4.0;
-    const rotate = String(getWidgetValue(node, "rotate_input", "0"));
-    const reverse = Boolean(getWidgetValue(node, "reverse", false));
-    const hwEnc = String(getWidgetValue(node, "hw_encoder", "auto"));
+const TRACK_PALETTE = {
+    V1: { fill: "rgba(14, 165, 233, 0.34)", stroke: "#0ea5e9", text: "#e0f2fe" },
+    V2: { fill: "rgba(139, 92, 246, 0.34)", stroke: "#8b5cf6", text: "#ede9fe" },
+    V3: { fill: "rgba(245, 158, 11, 0.34)", stroke: "#f59e0b", text: "#fef3c7" },
+    V4: { fill: "rgba(236, 72, 153, 0.34)", stroke: "#ec4899", text: "#fce7f3" },
+    A1: { fill: "rgba(16, 185, 129, 0.32)", stroke: "#10b981", text: "#d1fae5" },
+};
 
-    const mediaFile = String(getWidgetValue(node, "media_file", "none"));
-    const overlayFile = String(getWidgetValue(node, "overlay_file", "none"));
-    const alphaFile = String(getWidgetValue(node, "overlay_alpha_file", "none"));
-    const endcardFile = String(getWidgetValue(node, "endcard_file", "none"));
-    const audioFile = String(getWidgetValue(node, "audio_file", "none"));
+function syncTimelineInputs(node, timelineInfo) {
+    if (!node || !timelineInfo || !Array.isArray(timelineInfo.inputs)) return;
 
-    const hasMedia =
-        isInputLinked(node, "media_video") ||
-        isInputLinked(node, "media_image") ||
-        (mediaFile && mediaFile !== "none");
+    const desired = timelineInfo.inputs;
+    const desiredNames = new Set(desired.map((d) => d.name));
 
-    const hasOverlay =
-        isInputLinked(node, "overlay_video") ||
-        isInputLinked(node, "overlay_image") ||
-        (overlayFile && overlayFile !== "none");
-
-    const hasAlpha =
-        isInputLinked(node, "overlay_mask") ||
-        (alphaFile && alphaFile !== "none");
-
-    const hasEndcard =
-        isInputLinked(node, "endcard_video") ||
-        isInputLinked(node, "endcard_image") ||
-        (endcardFile && endcardFile !== "none");
-
-    const hasExternalAudio =
-        isInputLinked(node, "audio") ||
-        (audioFile && audioFile !== "none");
-
-    const mediaDur = executed ? executed.media_dur : stillDur;
-    const endcardDur = hasEndcard ? (executed && executed.has_endcard ? executed.endcard_dur : endcardWidgetDur) : 0;
-    const totalDur = Math.max(0.5, mediaDur + endcardDur);
-    const thumbTs = Math.min(2.0, mediaDur / 2.0);
-
-    let mediaLabel = "Media";
-    if (isInputLinked(node, "media_video")) mediaLabel = "Video In";
-    else if (isInputLinked(node, "media_image")) mediaLabel = "Image In";
-    else if (mediaFile !== "none") mediaLabel = mediaFile;
-
-    let overlayLabel = "Empty";
-    if (isInputLinked(node, "overlay_video")) overlayLabel = "Overlay Video";
-    else if (isInputLinked(node, "overlay_image")) overlayLabel = "Overlay Image";
-    else if (overlayFile !== "none") overlayLabel = overlayFile;
-
-    let endcardLabel = "None";
-    if (isInputLinked(node, "endcard_video")) endcardLabel = "Endcard Video";
-    else if (isInputLinked(node, "endcard_image")) endcardLabel = "Endcard Image";
-    else if (endcardFile !== "none") endcardLabel = endcardFile;
-
-    let audioLabel = isInputLinked(node, "media_video") ? "Embedded Audio" : "No Audio";
-    if (hasExternalAudio) {
-        audioLabel = isInputLinked(node, "audio") ? "Audio In (Backtimed)" : `${audioFile} (Backtimed)`;
-    } else if (executed && executed.audio_mode === "embedded_reversed") {
-        audioLabel = "Embedded Audio (Rev)";
+    // If upgrading an old node in-place that had media_video linked, rename media_video to the first video clip
+    if (node.inputs && desired.length > 0) {
+        const firstVideoSpec = desired.find((d) => d.role === "video") || desired[0];
+        const hasFirstAlready = node.inputs.some((i) => i.name === firstVideoSpec.name);
+        if (!hasFirstAlready) {
+            const legacyVid = node.inputs.find((i) => i.name === "media_video" && i.link != null);
+            if (legacyVid) {
+                legacyVid.name = firstVideoSpec.name;
+                legacyVid.type = firstVideoSpec.type;
+                legacyVid.label = firstVideoSpec.name;
+            }
+        }
     }
 
-    return {
-        hasMedia,
-        hasOverlay,
-        hasAlpha,
-        hasEndcard,
-        hasExternalAudio,
-        mediaDur,
-        endcardDur,
-        totalDur,
-        thumbTs,
-        rotate,
-        reverse,
-        hwEnc: executed ? executed.hw_encoder : hwEnc,
-        specs: executed ? `${executed.width}x${executed.height} @ ${executed.fps}fps` : "Pre-render Preview",
-        mediaLabel,
-        overlayLabel,
-        endcardLabel,
-        audioLabel,
-    };
+    // Remove inputs that are no longer part of the timeline
+    if (node.inputs) {
+        for (let i = node.inputs.length - 1; i >= 0; i--) {
+            const inp = node.inputs[i];
+            if (!desiredNames.has(inp.name)) {
+                node.removeInput(i);
+            }
+        }
+    }
+
+    // Add or update desired inputs in exact timeline order
+    for (let idx = 0; idx < desired.length; idx++) {
+        const spec = desired[idx];
+        let existingIdx = node.inputs ? node.inputs.findIndex((i) => i.name === spec.name) : -1;
+        if (existingIdx === -1) {
+            node.addInput(spec.name, spec.type);
+            existingIdx = node.inputs.length - 1;
+        } else {
+            node.inputs[existingIdx].type = spec.type;
+        }
+        const slot = node.inputs[existingIdx];
+        slot.label = spec.role === "matte" ? `${spec.name} [Matte]` : spec.name;
+    }
+
+    // Reorder node.inputs array to match desired order while updating link target_slot indices
+    if (node.inputs && node.inputs.length === desired.length) {
+        const ordered = [];
+        for (const spec of desired) {
+            const found = node.inputs.find((i) => i.name === spec.name);
+            if (found) ordered.push(found);
+        }
+        if (ordered.length === desired.length) {
+            node.inputs = ordered;
+            if (app.graph && app.graph.links) {
+                for (let slotIdx = 0; slotIdx < node.inputs.length; slotIdx++) {
+                    const lid = node.inputs[slotIdx].link;
+                    if (lid != null && app.graph.links[lid]) {
+                        app.graph.links[lid].target_slot = slotIdx;
+                    }
+                }
+            }
+        }
+    }
+
+    if (node.setSize && node.computeSize && node.size) {
+        const sz = node.computeSize();
+        node.setSize([Math.max(node.size[0], sz[0], 380), Math.max(node.size[1], sz[1])]);
+    }
+    if (app.graph) {
+        app.graph.setDirtyCanvas(true, true);
+    }
+}
+
+async function fetchAndApplyTimeline(node, filename, refreshCb) {
+    if (!filename || filename === "none") {
+        node._monolithOtioInfo = null;
+        if (refreshCb) refreshCb();
+        return;
+    }
+    try {
+        const resp = await api.fetchApi(`/monolith/nle/timeline_info?file=${encodeURIComponent(filename)}`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (data && data.valid) {
+            node._monolithOtioInfo = data;
+            syncTimelineInputs(node, data);
+            if (refreshCb) refreshCb();
+        }
+    } catch (err) {
+        console.warn("Monolith NLE: failed to load timeline info:", err);
+    }
+}
+
+function getTimelineCanvasHeight(node) {
+    const info = node._monolithNleMeta || node._monolithOtioInfo;
+    const tracks = info && Array.isArray(info.ui_tracks) ? info.ui_tracks : [];
+    const count = Math.max(3, tracks.length);
+    return 50 + count * 28;
 }
 
 function drawNleTimeline(canvas, node) {
     if (!canvas) return;
     const dpr = window.devicePixelRatio || 1;
     const rect = canvas.getBoundingClientRect();
-    const width = Math.max(280, rect.width || (node.size ? node.size[0] - 20 : 320));
-    const height = 148;
+    const width = Math.max(300, rect.width || (node.size ? node.size[0] - 20 : 360));
+    const height = getTimelineCanvasHeight(node);
 
+    if (canvas.style.height !== `${height}px`) {
+        canvas.style.height = `${height}px`;
+    }
     if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
         canvas.width = Math.round(width * dpr);
         canvas.height = Math.round(height * dpr);
@@ -114,7 +140,12 @@ function drawNleTimeline(canvas, node) {
     ctx.save();
     ctx.scale(dpr, dpr);
 
-    const st = getLiveTimelineState(node);
+    const info = node._monolithNleMeta || node._monolithOtioInfo;
+    const hwEnc = (node._monolithNleMeta && node._monolithNleMeta.hw_encoder) || getWidgetValue(node, "hw_encoder", "auto");
+    const totalDur = info && info.total_dur ? Math.max(0.5, parseFloat(info.total_dur)) : 13.125;
+    const specs = info && info.width
+        ? `${info.width}x${info.height} @ ${info.fps}fps (${info.total_frames}f)`
+        : "Select .otio / .xml timeline";
 
     // Background panel
     ctx.fillStyle = "#14171c";
@@ -133,19 +164,19 @@ function drawNleTimeline(canvas, node) {
 
     ctx.font = "600 10px Inter, system-ui, sans-serif";
     ctx.fillStyle = "#94a3b8";
-    ctx.fillText("NLE TIMELINE", 8, 16);
+    ctx.fillText("OTIO TIMELINE", 8, 16);
 
-    const badgeText = `${st.specs}  |  ${st.totalDur.toFixed(1)}s  |  ${String(st.hwEnc).toUpperCase()}`;
+    const badgeText = `${specs}  |  ${totalDur.toFixed(2)}s  |  ${String(hwEnc).toUpperCase()}`;
     ctx.font = "500 10px monospace";
     ctx.fillStyle = "#38bdf8";
     const bw = ctx.measureText(badgeText).width;
-    ctx.fillText(badgeText, Math.max(92, width - bw - 8), 16);
+    ctx.fillText(badgeText, Math.max(96, width - bw - 8), 16);
 
-    const labelColW = 54;
+    const labelColW = 46;
     const trackX = labelColW + 6;
     const trackW = Math.max(100, width - trackX - 10);
 
-    // Time Ruler (y = 26..42)
+    // Time Ruler (y = 25..42)
     ctx.fillStyle = "#181c23";
     ctx.fillRect(1, 25, width - 2, 17);
     ctx.strokeStyle = "#262c36";
@@ -154,11 +185,11 @@ function drawNleTimeline(canvas, node) {
     ctx.lineTo(width, 42);
     ctx.stroke();
 
-    const stepSec = st.totalDur <= 6 ? 1 : st.totalDur <= 16 ? 2 : 5;
+    const stepSec = totalDur <= 6 ? 1 : totalDur <= 16 ? 2 : 5;
     ctx.font = "9px monospace";
     ctx.fillStyle = "#64748b";
-    for (let t = 0; t <= st.totalDur + 0.01; t += stepSec) {
-        const x = trackX + (t / st.totalDur) * trackW;
+    for (let t = 0; t <= totalDur + 0.01; t += stepSec) {
+        const x = trackX + (t / totalDur) * trackW;
         ctx.strokeStyle = "#334155";
         ctx.beginPath();
         ctx.moveTo(x, 36);
@@ -167,118 +198,66 @@ function drawNleTimeline(canvas, node) {
         ctx.fillText(`${t.toFixed(0)}s`, Math.min(width - 20, x + 2), 35);
     }
 
-    const mediaFrac = Math.min(1.0, st.mediaDur / st.totalDur);
-    const mediaW = Math.max(16, mediaFrac * trackW);
-    const endcardW = Math.max(0, trackW - mediaW);
+    const rawTracks = info && Array.isArray(info.ui_tracks) ? info.ui_tracks : [];
+    const videoTracks = rawTracks.filter((t) => t.kind === "video").slice().reverse();
+    const audioTracks = rawTracks.filter((t) => t.kind === "audio");
+    const displayTracks = [...videoTracks, ...audioTracks];
 
-    const tracks = [
-        { id: "V2", y: 47, h: 26, title: "V2 OVR" },
-        { id: "V1", y: 78, h: 28, title: "V1 VID" },
-        { id: "A1", y: 111, h: 26, title: "A1 AUD" },
-    ];
+    let rowY = 46;
+    const rowH = 24;
 
-    for (const tr of tracks) {
+    for (const tr of displayTracks) {
         // Track label cell
         ctx.fillStyle = "#1b2028";
-        ctx.fillRect(4, tr.y, labelColW - 4, tr.h);
+        ctx.fillRect(4, rowY, labelColW - 4, rowH);
         ctx.font = "600 9px monospace";
-        ctx.fillStyle = "#94a3b8";
-        ctx.fillText(tr.title, 8, tr.y + tr.h / 2 + 3);
+        ctx.fillStyle = tr.kind === "audio" ? "#6ee7b7" : "#94a3b8";
+        ctx.fillText(tr.id, 10, rowY + rowH / 2 + 3);
 
         // Track lane background
         ctx.fillStyle = "#101317";
         ctx.strokeStyle = "#222731";
         ctx.beginPath();
-        ctx.roundRect(trackX, tr.y, trackW, tr.h, 4);
-        ctx.fill();
-        ctx.stroke();
-    }
-
-    // Track V2: Overlay (spans 0 -> mediaDur)
-    const v2 = tracks[0];
-    if (st.hasOverlay) {
-        ctx.fillStyle = "rgba(139, 92, 246, 0.32)";
-        ctx.strokeStyle = "#8b5cf6";
-        ctx.lineWidth = 1.2;
-        ctx.beginPath();
-        ctx.roundRect(trackX + 1, v2.y + 2, Math.max(12, mediaW - 2), v2.h - 4, 3);
+        ctx.roundRect(trackX, rowY, trackW, rowH, 4);
         ctx.fill();
         ctx.stroke();
 
-        ctx.font = "500 10px Inter, system-ui, sans-serif";
-        ctx.fillStyle = "#ede9fe";
-        const alphaTag = st.hasAlpha ? " [+ALPHA]" : "";
-        ctx.fillText(`${st.overlayLabel}${alphaTag}`, trackX + 7, v2.y + 16);
-    } else {
-        ctx.font = "italic 9px Inter, system-ui, sans-serif";
-        ctx.fillStyle = "#475569";
-        ctx.fillText("No overlay connected", trackX + 8, v2.y + 16);
-    }
+        const pal = TRACK_PALETTE[tr.id] || (tr.kind === "audio" ? TRACK_PALETTE.A1 : TRACK_PALETTE.V2);
 
-    // Track V1: Media (0 -> mediaDur) + Endcard (mediaDur -> totalDur)
-    const v1 = tracks[1];
-    ctx.fillStyle = st.hasMedia ? "rgba(14, 165, 233, 0.34)" : "rgba(100, 116, 139, 0.2)";
-    ctx.strokeStyle = st.hasMedia ? "#0ea5e9" : "#475569";
-    ctx.lineWidth = 1.2;
-    ctx.beginPath();
-    ctx.roundRect(trackX + 1, v1.y + 2, Math.max(12, mediaW - 2), v1.h - 4, 3);
-    ctx.fill();
-    ctx.stroke();
+        for (const cl of tr.clips || []) {
+            const x0 = trackX + Math.max(0, Math.min(1, cl.start / totalDur)) * trackW;
+            const x1 = trackX + Math.max(0, Math.min(1, cl.end / totalDur)) * trackW;
+            const cw = Math.max(10, x1 - x0);
+            const linked = isInputLinked(node, cl.name) || (cl.matte && isInputLinked(node, cl.matte));
 
-    const flags = [];
-    if (st.reverse) flags.push("REV");
-    if (st.rotate !== "0") flags.push(st.rotate);
-    const flagStr = flags.length ? ` [${flags.join(",")}]` : "";
-    ctx.font = "600 10px Inter, system-ui, sans-serif";
-    ctx.fillStyle = st.hasMedia ? "#e0f2fe" : "#94a3b8";
-    ctx.fillText(`${st.mediaLabel}${flagStr} (${st.mediaDur.toFixed(1)}s)`, trackX + 7, v1.y + 17);
-
-    if (st.hasEndcard && endcardW > 6) {
-        ctx.fillStyle = "rgba(245, 158, 11, 0.32)";
-        ctx.strokeStyle = "#f59e0b";
-        ctx.beginPath();
-        ctx.roundRect(trackX + mediaW + 1, v1.y + 2, Math.max(8, endcardW - 2), v1.h - 4, 3);
-        ctx.fill();
-        ctx.stroke();
-
-        ctx.font = "600 10px Inter, system-ui, sans-serif";
-        ctx.fillStyle = "#fef3c7";
-        ctx.fillText(`Endcard (${st.endcardDur.toFixed(1)}s)`, trackX + mediaW + 6, v1.y + 17);
-    }
-
-    // Track A1: Audio (Backtimed across totalDur or Embedded)
-    const a1 = tracks[2];
-    const audioActive = st.hasExternalAudio || isInputLinked(node, "media_video");
-    const audioSpanW = st.hasExternalAudio ? trackW : mediaW;
-    if (audioActive) {
-        ctx.fillStyle = st.hasExternalAudio ? "rgba(16, 185, 129, 0.30)" : "rgba(20, 184, 166, 0.22)";
-        ctx.strokeStyle = st.hasExternalAudio ? "#10b981" : "#14b8a6";
-        ctx.beginPath();
-        ctx.roundRect(trackX + 1, a1.y + 2, Math.max(12, audioSpanW - 2), a1.h - 4, 3);
-        ctx.fill();
-        ctx.stroke();
-
-        // Draw 6-frame fade-in diagonal ramp on external audio
-        if (st.hasExternalAudio) {
-            ctx.strokeStyle = "#6ee7b7";
-            ctx.lineWidth = 1.5;
+            ctx.fillStyle = linked ? "rgba(56, 189, 248, 0.42)" : pal.fill;
+            ctx.strokeStyle = linked ? "#38bdf8" : pal.stroke;
+            ctx.lineWidth = linked ? 1.6 : 1.1;
             ctx.beginPath();
-            ctx.moveTo(trackX + 2, a1.y + a1.h - 3);
-            ctx.lineTo(trackX + 18, a1.y + 3);
+            ctx.roundRect(x0 + 1, rowY + 2, Math.max(8, cw - 2), rowH - 4, 3);
+            ctx.fill();
             ctx.stroke();
+
+            const prefix = linked ? "[IN] " : "";
+            const matteTag = cl.matte ? ` [+${cl.matte}]` : "";
+            const label = `${prefix}${cl.name}${matteTag}`;
+
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(x0 + 3, rowY + 2, Math.max(4, cw - 6), rowH - 4);
+            ctx.clip();
+            ctx.font = "500 9.5px Inter, system-ui, sans-serif";
+            ctx.fillStyle = pal.text;
+            ctx.fillText(label, x0 + 6, rowY + 15);
+            ctx.restore();
         }
 
-        ctx.font = "500 10px Inter, system-ui, sans-serif";
-        ctx.fillStyle = "#d1fae5";
-        ctx.fillText(st.audioLabel, trackX + (st.hasExternalAudio ? 22 : 7), a1.y + 16);
-    } else {
-        ctx.font = "italic 9px Inter, system-ui, sans-serif";
-        ctx.fillStyle = "#475569";
-        ctx.fillText("Muted / No audio source", trackX + 8, a1.y + 16);
+        rowY += rowH + 4;
     }
 
-    // Midpoint thumbnail extraction marker (playhead line)
-    const thumbX = trackX + Math.min(1.0, st.thumbTs / st.totalDur) * trackW;
+    // Playhead midpoint marker
+    const thumbTs = Math.min(2.0, totalDur / 2.0);
+    const thumbX = trackX + Math.min(1.0, thumbTs / totalDur) * trackW;
     ctx.strokeStyle = "#f43f5e";
     ctx.lineWidth = 1;
     ctx.setLineDash([3, 2]);
@@ -288,15 +267,60 @@ function drawNleTimeline(canvas, node) {
     ctx.stroke();
     ctx.setLineDash([]);
 
-    ctx.fillStyle = "#f43f5e";
-    ctx.beginPath();
-    ctx.moveTo(thumbX - 4, 38);
-    ctx.lineTo(thumbX + 4, 38);
-    ctx.lineTo(thumbX, 43);
-    ctx.closePath();
-    ctx.fill();
-
     ctx.restore();
+}
+
+function attachUploadTimelineButton(node, onTimelineSelected) {
+    const fileInput = document.createElement("input");
+    fileInput.type = "file";
+    fileInput.accept = ".otio,.xml";
+    fileInput.style.display = "none";
+    document.body.appendChild(fileInput);
+
+    fileInput.onchange = async () => {
+        if (!fileInput.files || !fileInput.files.length) return;
+        const file = fileInput.files[0];
+        const formData = new FormData();
+        formData.append("image", file);
+        formData.append("overwrite", "true");
+        try {
+            const resp = await api.fetchApi("/upload/image", {
+                method: "POST",
+                body: formData,
+            });
+            if (resp.ok) {
+                const res = await resp.json();
+                const uploadedName = res.name || file.name;
+                const tlWidget = node.widgets ? node.widgets.find((w) => w.name === "timeline_file") : null;
+                if (tlWidget) {
+                    if (tlWidget.options && Array.isArray(tlWidget.options.values)) {
+                        if (!tlWidget.options.values.includes(uploadedName)) {
+                            tlWidget.options.values.unshift(uploadedName);
+                        }
+                    }
+                    tlWidget.value = uploadedName;
+                }
+                if (onTimelineSelected) {
+                    onTimelineSelected(uploadedName);
+                }
+            }
+        } catch (err) {
+            console.error("Monolith NLE: failed to upload timeline file:", err);
+        }
+    };
+
+    const btn = node.addWidget("button", "Upload .otio / .xml", null, () => {
+        fileInput.click();
+    });
+    btn.serialize = false;
+
+    const origRemoved = node.onRemoved;
+    node.onRemoved = function () {
+        if (origRemoved) origRemoved.apply(this, arguments);
+        if (fileInput.parentNode) {
+            fileInput.parentNode.removeChild(fileInput);
+        }
+    };
 }
 
 function attachVideoPlayerAndTimeline(node, includeTimeline) {
@@ -312,7 +336,7 @@ function attachVideoPlayerAndTimeline(node, includeTimeline) {
     if (includeTimeline) {
         canvas = document.createElement("canvas");
         canvas.style.width = "100%";
-        canvas.style.height = "148px";
+        canvas.style.height = "190px";
         canvas.style.display = "block";
         canvas.style.borderRadius = "6px";
         container.appendChild(canvas);
@@ -337,7 +361,7 @@ function attachVideoPlayerAndTimeline(node, includeTimeline) {
     });
 
     domWidget.computeSize = function (width) {
-        const timelineH = includeTimeline ? 156 : 0;
+        const timelineH = includeTimeline ? getTimelineCanvasHeight(node) + 8 : 0;
         const videoH = videoEl.style.display !== "none" ? 220 : 0;
         return [width, timelineH + videoH];
     };
@@ -346,10 +370,29 @@ function attachVideoPlayerAndTimeline(node, includeTimeline) {
         if (canvas) {
             drawNleTimeline(canvas, node);
         }
+        if (node.setSize && node.computeSize && node.size) {
+            const sz = node.computeSize();
+            node.setSize([Math.max(node.size[0], sz[0], 380), Math.max(node.size[1], sz[1])]);
+        }
     };
 
+    attachUploadTimelineButton(node, (uploadedFile) => {
+        fetchAndApplyTimeline(node, uploadedFile, refresh);
+    });
+
+    const tlWidget = node.widgets ? node.widgets.find((w) => w.name === "timeline_file") : null;
+    if (tlWidget) {
+        const origCb = tlWidget.callback;
+        tlWidget.callback = function (val) {
+            if (origCb) origCb.apply(this, arguments);
+            fetchAndApplyTimeline(node, val, refresh);
+        };
+        setTimeout(() => {
+            fetchAndApplyTimeline(node, tlWidget.value, refresh);
+        }, 40);
+    }
+
     if (includeTimeline) {
-        setTimeout(refresh, 50);
         const origConn = node.onConnectionsChange;
         node.onConnectionsChange = function () {
             if (origConn) origConn.apply(this, arguments);
@@ -358,17 +401,8 @@ function attachVideoPlayerAndTimeline(node, includeTimeline) {
         const origResize = node.onResize;
         node.onResize = function () {
             if (origResize) origResize.apply(this, arguments);
-            refresh();
+            if (canvas) drawNleTimeline(canvas, node);
         };
-        if (node.widgets) {
-            for (const w of node.widgets) {
-                const origCb = w.callback;
-                w.callback = function () {
-                    if (origCb) origCb.apply(this, arguments);
-                    refresh();
-                };
-            }
-        }
     }
 
     const origExecuted = node.onExecuted;
@@ -387,13 +421,71 @@ function attachVideoPlayerAndTimeline(node, includeTimeline) {
             });
             videoEl.src = api.apiURL(`/view?${params.toString()}`);
             videoEl.style.display = "block";
-            if (node.setSize && node.computeSize) {
-                const sz = node.computeSize();
-                node.setSize([Math.max(node.size[0], sz[0]), Math.max(node.size[1], sz[1])]);
-            }
         }
         refresh();
     };
+
+    node._monolithRefreshTimeline = refresh;
+}
+
+function setWidgetVisible(w, visible) {
+    if (!w) return;
+    if (!Object.prototype.hasOwnProperty.call(w, "_monolithOrigComputeSize")) {
+        w._monolithOrigComputeSize = w.computeSize;
+    }
+    w.hidden = !visible;
+    if (visible) {
+        if (w._monolithOrigComputeSize) {
+            w.computeSize = w._monolithOrigComputeSize;
+        } else {
+            delete w.computeSize;
+        }
+    } else {
+        w.computeSize = () => [0, -4];
+    }
+}
+
+function setupFaceSwapSaveVideoToggle(node) {
+    const saveW = node.widgets ? node.widgets.find((w) => w.name === "save_video") : null;
+    if (!saveW) return;
+
+    const prefixW = node.widgets ? node.widgets.find((w) => w.name === "filename_prefix") : null;
+    const applyReplacements = window.comfyAPI?.utils?.applyTextReplacements;
+    if (prefixW && typeof applyReplacements === "function") {
+        prefixW.serializeValue = () => applyReplacements(app, prefixW.value);
+    }
+
+    const syncSaveVideoWidgets = () => {
+        const show = Boolean(saveW.value);
+        for (const name of ["filename_prefix", "video_quality", "use_gpu_encode"]) {
+            const w = node.widgets ? node.widgets.find((item) => item.name === name) : null;
+            setWidgetVisible(w, show);
+        }
+        if (node.setSize && node.computeSize && node.size) {
+            const sz = node.computeSize();
+            node.setSize([node.size[0], sz[1]]);
+        }
+        if (app.graph) {
+            app.graph.setDirtyCanvas(true, true);
+        }
+    };
+
+    const origCb = saveW.callback;
+    saveW.callback = function () {
+        const r = origCb ? origCb.apply(this, arguments) : undefined;
+        syncSaveVideoWidgets();
+        return r;
+    };
+
+    syncSaveVideoWidgets();
+}
+
+function upgradeInputSlotType(node, inputName, newType) {
+    if (!node || !node.inputs) return;
+    const inp = node.inputs.find((i) => i.name === inputName);
+    if (inp) {
+        inp.type = newType;
+    }
 }
 
 app.registerExtension({
@@ -408,10 +500,78 @@ app.registerExtension({
             const origCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {
                 if (origCreated) origCreated.apply(this, arguments);
-                if (includeTimeline && this.size) {
-                    this.size[0] = Math.max(this.size[0], 360);
+                if (this.size) {
+                    this.size[0] = Math.max(this.size[0], 390);
                 }
                 attachVideoPlayerAndTimeline(this, includeTimeline);
+            };
+            const origConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function (info) {
+                // Migrate legacy pre-OTIO widget array if loading an older workflow
+                if (
+                    info &&
+                    Array.isArray(info.widgets_values) &&
+                    (info.widgets_values.length > 4 || typeof info.widgets_values[1] === "boolean")
+                ) {
+                    const tl = typeof info.widgets_values[0] === "string" && info.widgets_values[0].endsWith(".otio")
+                        ? info.widgets_values[0]
+                        : "dutton_ranch_premiere.otio";
+                    info.widgets_values = [tl, "auto", false];
+                }
+                if (origConfigure) origConfigure.apply(this, arguments);
+                const hwW = this.widgets ? this.widgets.find((w) => w.name === "hw_encoder") : null;
+                if (hwW && typeof hwW.value !== "string") {
+                    hwW.value = "auto";
+                }
+                const tlFile = getWidgetValue(this, "timeline_file", "dutton_ranch_premiere.otio");
+                fetchAndApplyTimeline(this, tlFile, this._monolithRefreshTimeline);
+            };
+        } else if (nodeData.name === "MonolithNLEOverlayTrack") {
+            const origCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                if (origCreated) origCreated.apply(this, arguments);
+                upgradeInputSlotType(this, "overlay_mask", "MASK,VIDEO,IMAGE");
+            };
+            const origConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function () {
+                if (origConfigure) origConfigure.apply(this, arguments);
+                upgradeInputSlotType(this, "overlay_mask", "MASK,VIDEO,IMAGE");
+            };
+        } else if (nodeData.name === "MonolithPromptSwitchByImage") {
+            const origCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                if (origCreated) origCreated.apply(this, arguments);
+                upgradeInputSlotType(this, "image", "IMAGE,VIDEO");
+            };
+            const origConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function () {
+                if (origConfigure) origConfigure.apply(this, arguments);
+                upgradeInputSlotType(this, "image", "IMAGE,VIDEO");
+            };
+        } else if (nodeData.name === "MonolithFaceSwap") {
+            const origCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                if (origCreated) origCreated.apply(this, arguments);
+                setupFaceSwapSaveVideoToggle(this);
+            };
+
+            const origConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function (info) {
+                if (
+                    info &&
+                    Array.isArray(info.widgets_values) &&
+                    info.widgets_values.length === 19 &&
+                    typeof info.widgets_values[16] === "number"
+                ) {
+                    info.widgets_values = [
+                        ...info.widgets_values.slice(0, 16),
+                        false,
+                        "video/ComfyUI",
+                        ...info.widgets_values.slice(16),
+                    ];
+                }
+                if (origConfigure) origConfigure.apply(this, arguments);
+                setupFaceSwapSaveVideoToggle(this);
             };
         }
     },

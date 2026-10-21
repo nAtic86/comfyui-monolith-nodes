@@ -23,7 +23,7 @@ class MonolithPromptSwitchByImage:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "image": ("IMAGE", {"tooltip": "Connect an image (e.g. from LoadImage). The upstream filename is detected automatically."}),
+                "image": ("IMAGE,VIDEO", {"tooltip": "Connect an image or video (e.g. from LoadImage or LoadVideo). The upstream filename is detected automatically."}),
                 "rules": ("STRING", {
                     "multiline": True,
                     "default": DEFAULT_RULES,
@@ -83,7 +83,7 @@ class MonolithPromptSwitchByImage:
                 continue
             visited.add(node_id)
             inputs = prompt[node_id].get("inputs", {})
-            for key in ("image", "filename", "file", "image_path"):
+            for key in ("image", "video", "filename", "file", "image_path", "video_file", "image_file", "media_file"):
                 val = inputs.get(key)
                 if isinstance(val, str) and val.strip():
                     return val.strip()

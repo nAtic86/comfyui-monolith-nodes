@@ -7,7 +7,9 @@ import shutil
 import subprocess
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
+import urllib.parse
 import wave
+import xml.etree.ElementTree as ET
 
 import numpy as np
 from PIL import Image
@@ -36,6 +38,9 @@ JELLYFIN_FFPROBE = Path("/usr/lib/jellyfin-ffmpeg/ffprobe")
 
 _CACHED_HW_ENCODER: Optional[str] = None
 
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".avif")
+AUDIO_EXTS = (".mp3", ".wav", ".aac", ".m4a", ".flac", ".ogg", ".opus")
+
 ROTATE_MAP = {
     "0": "0",
     "90CW": "1",
@@ -45,6 +50,26 @@ ROTATE_MAP = {
     "2": "2",
     "3": "3",
 }
+
+
+class _AnyType(str):
+    def __ne__(self, __value: object) -> bool:
+        return False
+
+
+ANY_TYPE = _AnyType("*")
+
+
+class _FlexibleOptionalDict(dict):
+    """Allows dynamic input sockets populated from OTIO/XML timelines to pass ComfyUI input lookup."""
+
+    def __contains__(self, key: object) -> bool:
+        return True
+
+    def __getitem__(self, key: str) -> Any:
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        return (ANY_TYPE,)
 
 
 def get_ffmpeg_bin() -> str:
@@ -123,41 +148,80 @@ def get_input_audio_files() -> List[str]:
     return _list_input_files(["audio", "video"])
 
 
-def _resolve_input_file(filename: str) -> Optional[str]:
+def get_timeline_files() -> List[str]:
+    found = set()
+    for base_dir in (folder_paths.get_input_directory(), folder_paths.get_temp_directory()):
+        try:
+            if not base_dir or not os.path.isdir(base_dir):
+                continue
+            for fn in os.listdir(base_dir):
+                low = fn.lower()
+                if low.endswith((".otio", ".xml")) and os.path.isfile(os.path.join(base_dir, fn)):
+                    found.add(fn)
+        except Exception:
+            pass
+    otio_files = sorted(f for f in found if f.lower().endswith(".otio"))
+    xml_files = sorted(f for f in found if f.lower().endswith(".xml"))
+    return otio_files + xml_files + ["none"]
+
+
+def _resolve_file_in_dirs(filename: str, search_dirs: List[str]) -> Optional[str]:
     if not filename or filename == "none":
         return None
-    input_dir = os.path.realpath(folder_paths.get_input_directory())
-    try:
-        all_files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
-        exact, canonical = MonolithPromptSwitchByImage._build_lookup([(f, f) for f in all_files])
-        resolved_name, _ = MonolithPromptSwitchByImage._resolve_lookup(
-            filename, exact, canonical, default=filename
-        )
-    except Exception:
-        resolved_name = filename
-
-    candidate = os.path.realpath(os.path.join(input_dir, resolved_name))
-    if candidate.startswith(input_dir + os.sep) and os.path.isfile(candidate):
-        return candidate
+    clean_name = os.path.basename(filename.replace("\\", "/"))
+    for raw_dir in search_dirs:
+        if not raw_dir or not os.path.isdir(raw_dir):
+            continue
+        real_dir = os.path.realpath(raw_dir)
+        direct = os.path.realpath(os.path.join(real_dir, clean_name))
+        if direct.startswith(real_dir + os.sep) and os.path.isfile(direct):
+            return direct
+        try:
+            all_files = [f for f in os.listdir(real_dir) if os.path.isfile(os.path.join(real_dir, f))]
+            exact, canonical = MonolithPromptSwitchByImage._build_lookup([(f, f) for f in all_files])
+            resolved_name, matched = MonolithPromptSwitchByImage._resolve_lookup(
+                clean_name, exact, canonical, default=""
+            )
+            if matched and resolved_name:
+                cand = os.path.realpath(os.path.join(real_dir, resolved_name))
+                if cand.startswith(real_dir + os.sep) and os.path.isfile(cand):
+                    return cand
+        except Exception:
+            pass
     return None
 
 
-def _parse_fps(fps_str: str) -> float:
+def _resolve_input_file(filename: str, extra_dirs: Optional[List[str]] = None) -> Optional[str]:
+    dirs = list(extra_dirs or []) + [
+        folder_paths.get_input_directory(),
+        folder_paths.get_temp_directory(),
+    ]
+    return _resolve_file_in_dirs(filename, dirs)
+
+
+def _resolve_timeline_file(filename: str) -> Optional[str]:
+    return _resolve_file_in_dirs(
+        filename,
+        [folder_paths.get_input_directory(), folder_paths.get_temp_directory()],
+    )
+
+
+def _parse_fps(fps_str: Any) -> float:
     try:
         if "/" in str(fps_str):
             num, den = str(fps_str).split("/", 1)
             den_f = float(den)
-            return float(num) / den_f if den_f != 0 else 25.0
+            return float(num) / den_f if den_f != 0 else 24.0
         return float(fps_str)
     except Exception:
-        return 25.0
+        return 24.0
 
 
 def probe_media_specs(
     path: str, ffprobe_bin: str = "ffprobe", still_duration: float = 4.0
 ) -> Tuple[int, int, str, float, bool]:
     ext = os.path.splitext(path)[1].lower()
-    is_image = ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff")
+    is_image = ext in IMAGE_EXTS
 
     cmd = [
         ffprobe_bin,
@@ -174,12 +238,12 @@ def probe_media_specs(
     r = subprocess.run(cmd, capture_output=True, text=True)
     data = json.loads(r.stdout) if r.stdout else {}
     stream = data.get("streams", [{}])[0] if data.get("streams") else {}
-    fps = stream.get("r_frame_rate", "25/1")
-    width = int(stream.get("width", 1080))
-    height = int(stream.get("height", 1920))
+    fps = stream.get("r_frame_rate", "24/1")
+    width = int(stream.get("width", 720))
+    height = int(stream.get("height", 1280))
 
     if is_image:
-        return width, height, "25/1", float(still_duration), True
+        return width, height, "24/1", float(still_duration), True
 
     if "duration" in stream and float(stream["duration"]) > 0.1:
         duration = float(stream["duration"])
@@ -244,25 +308,377 @@ def extract_middle_frame(video_path: str, thumb_path: str, media_dur: Optional[f
         return False
 
 
+def _extract_filename_from_url(target_url: str, fallback_name: str = "") -> str:
+    if target_url:
+        unquoted = urllib.parse.unquote(target_url)
+        if unquoted.startswith("file://"):
+            unquoted = unquoted[7:]
+        base = os.path.basename(unquoted.replace("\\", "/"))
+        if base:
+            return base
+    return os.path.basename(fallback_name.replace("\\", "/")) if fallback_name else "clip"
+
+
+def _pair_matte_tracks_and_build_inputs(
+    video_tracks: List[Dict[str, Any]],
+    audio_tracks: List[Dict[str, Any]],
+    rate: float,
+    total_frames: int,
+    width: int,
+    height: int,
+    timeline_dir: str,
+) -> Dict[str, Any]:
+    # Pair alpha/matte clips across adjacent video tracks:
+    # Rule A: Premiere effect "Alpha Adjust" (AE.ADBE Alpha Adjust) on upper clip or "Track Matte Key" on lower clip
+    # Rule B: Upper clip filename stem ends with _alpha, _matte, or _mask over the same timeline span
+    for i in range(len(video_tracks) - 1):
+        lower_track = video_tracks[i]
+        upper_track = video_tracks[i + 1]
+        for lclip in lower_track["clips"]:
+            if lclip.get("matte_clip") is not None:
+                continue
+            has_track_matte_fx = any(
+                "Track Matte" in en or "Track Matte" in mn
+                for en, mn in lclip.get("effects", [])
+            )
+            for uclip in list(upper_track["clips"]):
+                has_alpha_fx = any(
+                    "Alpha Adjust" in en or "Alpha Adjust" in mn
+                    for en, mn in uclip.get("effects", [])
+                )
+                stem = os.path.splitext(uclip["filename"].lower())[0]
+                is_alpha_named = stem.endswith(("_alpha", "_matte", "_mask"))
+                same_span = (
+                    abs(lclip["timeline_start_f"] - uclip["timeline_start_f"]) <= 1.0
+                    and abs(lclip["timeline_end_f"] - uclip["timeline_end_f"]) <= 1.0
+                )
+                if same_span and (has_alpha_fx or has_track_matte_fx or is_alpha_named):
+                    uclip["role"] = "matte"
+                    lclip["matte_clip"] = uclip
+                    upper_track["clips"].remove(uclip)
+                    break
+
+    active_video_tracks = [t for t in video_tracks if t["clips"]]
+
+    # If resolution wasn't stored in sequence header (e.g. DaVinci Resolve OTIO), probe first resolved video clip
+    if width <= 0 or height <= 0:
+        width, height = 720, 1280
+        for tr in active_video_tracks:
+            for cl in tr["clips"]:
+                resolved = _resolve_input_file(cl["filename"], [timeline_dir])
+                if resolved:
+                    try:
+                        pw, ph, _, _, _ = probe_media_specs(resolved, get_ffprobe_bin())
+                        if pw > 0 and ph > 0:
+                            width, height = pw, ph
+                            break
+                    except Exception:
+                        pass
+            else:
+                continue
+            break
+
+    # Build ordered unique input socket declarations and visual track summary
+    inputs_spec: List[Dict[str, Any]] = []
+    seen_names = set()
+    ui_tracks: List[Dict[str, Any]] = []
+
+    def _add_input_spec(clip_dict: Dict[str, Any], role: str, track_label: str):
+        fn = clip_dict["filename"]
+        if fn in seen_names:
+            return
+        seen_names.add(fn)
+        ext = os.path.splitext(fn)[1].lower()
+        if role == "matte":
+            sock_type = "MASK,VIDEO,IMAGE"
+        elif role == "audio" or ext in AUDIO_EXTS:
+            sock_type = "AUDIO"
+        elif ext in IMAGE_EXTS:
+            sock_type = "IMAGE,VIDEO"
+            role = "image"
+        else:
+            sock_type = "VIDEO,IMAGE"
+        resolved_path = _resolve_input_file(fn, [timeline_dir])
+        inputs_spec.append({
+            "name": fn,
+            "type": sock_type,
+            "role": role,
+            "track": track_label,
+            "start": round(clip_dict["timeline_start_f"] / rate, 3),
+            "end": round(clip_dict["timeline_end_f"] / rate, 3),
+            "duration": round(clip_dict["timeline_dur_f"] / rate, 3),
+            "src_in": round(clip_dict["src_in_f"] / rate, 3),
+            "resolved": bool(resolved_path),
+            "matte": clip_dict["matte_clip"]["filename"] if clip_dict.get("matte_clip") else None,
+        })
+
+    for v_idx, tr in enumerate(active_video_tracks):
+        t_label = f"V{v_idx + 1}"
+        ui_clips = []
+        for cl in tr["clips"]:
+            _add_input_spec(cl, "video", t_label)
+            matte_cl = cl.get("matte_clip")
+            if matte_cl:
+                _add_input_spec(matte_cl, "matte", f"{t_label}M")
+            ui_clips.append({
+                "name": cl["filename"],
+                "start": round(cl["timeline_start_f"] / rate, 3),
+                "end": round(cl["timeline_end_f"] / rate, 3),
+                "duration": round(cl["timeline_dur_f"] / rate, 3),
+                "matte": matte_cl["filename"] if matte_cl else None,
+                "is_image": os.path.splitext(cl["filename"])[1].lower() in IMAGE_EXTS,
+            })
+        ui_tracks.append({
+            "id": t_label,
+            "name": tr.get("name") or t_label,
+            "kind": "video",
+            "clips": ui_clips,
+        })
+
+    for a_idx, tr in enumerate(audio_tracks):
+        t_label = f"A{a_idx + 1}"
+        ui_clips = []
+        for cl in tr["clips"]:
+            _add_input_spec(cl, "audio", t_label)
+            ui_clips.append({
+                "name": cl["filename"],
+                "start": round(cl["timeline_start_f"] / rate, 3),
+                "end": round(cl["timeline_end_f"] / rate, 3),
+                "duration": round(cl["timeline_dur_f"] / rate, 3),
+                "src_in": round(cl["src_in_f"] / rate, 3),
+            })
+        ui_tracks.append({
+            "id": t_label,
+            "name": tr.get("name") or t_label,
+            "kind": "audio",
+            "clips": ui_clips,
+        })
+
+    total_dur = total_frames / rate if rate > 0 else 0.0
+    return {
+        "valid": True,
+        "width": width,
+        "height": height,
+        "rate": rate,
+        "fps": round(rate, 2),
+        "total_frames": total_frames,
+        "total_dur": round(total_dur, 4),
+        "duration_s": total_dur,
+        "video_tracks": active_video_tracks,
+        "audio_tracks": audio_tracks,
+        "inputs": inputs_spec,
+        "ui_tracks": ui_tracks,
+    }
+
+
+def parse_nle_timeline(path: str) -> Dict[str, Any]:
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError(f"Monolith NLE: timeline file not found: {path}")
+
+    timeline_dir = os.path.dirname(os.path.realpath(path))
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".xml":
+        return _parse_fcp7_xml_timeline(path, timeline_dir)
+    return _parse_otio_json_timeline(path, timeline_dir)
+
+
+def _parse_otio_json_timeline(path: str, timeline_dir: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    tracks_data = data.get("tracks", {})
+    meta = tracks_data.get("metadata", {}).get("PremierePro_OTIO", {})
+    vr = meta.get("VideoResolution", {})
+    width = int(vr.get("Width", 0)) if vr else 0
+    height = int(vr.get("Height", 0)) if vr else 0
+
+    video_tracks: List[Dict[str, Any]] = []
+    audio_tracks: List[Dict[str, Any]] = []
+    rate = 24.0
+    total_frames = 0
+
+    for track in tracks_data.get("children", []):
+        if not str(track.get("OTIO_SCHEMA", "")).startswith("Track.") or not track.get("enabled", True):
+            continue
+        kind = track.get("kind", "Video")
+        cursor_frames = 0.0
+        clips = []
+        for item in track.get("children", []):
+            schema = str(item.get("OTIO_SCHEMA", ""))
+            sr = item.get("source_range")
+            if not sr:
+                continue
+            dur = float(sr["duration"]["value"])
+            item_rate = float(sr["duration"].get("rate", 24.0))
+            if item_rate > 0:
+                rate = item_rate
+            src_in = float(sr["start_time"]["value"])
+
+            if schema.startswith("Gap."):
+                cursor_frames += dur
+            elif schema.startswith("Clip."):
+                if item.get("enabled", True):
+                    mrs = item.get("media_references", {})
+                    mr = mrs.get("DEFAULT_MEDIA") or (next(iter(mrs.values())) if mrs else {})
+                    target_url = mr.get("target_url", "")
+                    filename = _extract_filename_from_url(target_url, item.get("name", ""))
+                    effects = []
+                    for eff in item.get("effects", []):
+                        eff_name = eff.get("effect_name", "")
+                        match_name = (
+                            eff.get("metadata", {})
+                            .get("PremierePro_OTIO", {})
+                            .get("Effect", {})
+                            .get("MatchName", "")
+                        )
+                        effects.append((eff_name, match_name))
+                    clips.append({
+                        "name": item.get("name") or filename,
+                        "filename": filename,
+                        "target_url": target_url,
+                        "timeline_start_f": cursor_frames,
+                        "timeline_end_f": cursor_frames + dur,
+                        "timeline_dur_f": dur,
+                        "src_in_f": src_in,
+                        "rate": rate,
+                        "effects": effects,
+                    })
+                cursor_frames += dur
+        total_frames = max(total_frames, int(round(cursor_frames)))
+        if kind == "Video" and clips:
+            video_tracks.append({"name": track.get("name", ""), "clips": clips})
+        elif kind == "Audio" and clips:
+            audio_tracks.append({"name": track.get("name", ""), "clips": clips})
+
+    return _pair_matte_tracks_and_build_inputs(
+        video_tracks, audio_tracks, rate, total_frames, width, height, timeline_dir
+    )
+
+
+def _parse_fcp7_xml_timeline(path: str, timeline_dir: str) -> Dict[str, Any]:
+    tree = ET.parse(path)
+    root = tree.getroot()
+    seq = root.find(".//sequence")
+    if seq is None:
+        raise ValueError(f"Monolith NLE: no <sequence> found in XML timeline {path}")
+
+    rate = float(seq.findtext("./rate/timebase", "24.0"))
+    total_frames = int(float(seq.findtext("./duration", "0")))
+    width = int(float(seq.findtext("./media/video/format/samplecharacteristics/width", "0")))
+    height = int(float(seq.findtext("./media/video/format/samplecharacteristics/height", "0")))
+
+    file_url_map: Dict[str, str] = {}
+    for file_el in seq.findall(".//file"):
+        fid = file_el.get("id")
+        purl = file_el.findtext("pathurl", "")
+        if fid and purl:
+            file_url_map[fid] = purl
+
+    video_tracks: List[Dict[str, Any]] = []
+    for t_idx, vtrack in enumerate(seq.findall("./media/video/track")):
+        if vtrack.findtext("enabled", "TRUE").upper() == "FALSE":
+            continue
+        clips = []
+        for ci in vtrack.findall("clipitem"):
+            if ci.findtext("enabled", "TRUE").upper() == "FALSE":
+                continue
+            start_f = float(ci.findtext("start", "0"))
+            end_f = float(ci.findtext("end", "0"))
+            in_f = float(ci.findtext("in", "0"))
+            dur_f = max(0.0, end_f - start_f)
+            file_el = ci.find("file")
+            purl = ""
+            if file_el is not None:
+                purl = file_el.findtext("pathurl", "") or file_url_map.get(file_el.get("id", ""), "")
+            cname = ci.findtext("name", "")
+            filename = _extract_filename_from_url(purl, cname)
+            total_frames = max(total_frames, int(round(end_f)))
+            clips.append({
+                "name": cname or filename,
+                "filename": filename,
+                "target_url": purl,
+                "timeline_start_f": start_f,
+                "timeline_end_f": end_f,
+                "timeline_dur_f": dur_f,
+                "src_in_f": in_f,
+                "rate": rate,
+                "effects": [],
+            })
+        if clips:
+            video_tracks.append({"name": f"Video {t_idx + 1}", "clips": clips})
+
+    audio_tracks: List[Dict[str, Any]] = []
+    seen_audio_spans = set()
+    for t_idx, atrack in enumerate(seq.findall("./media/audio/track")):
+        if atrack.findtext("enabled", "TRUE").upper() == "FALSE":
+            continue
+        clips = []
+        for ci in atrack.findall("clipitem"):
+            if ci.findtext("enabled", "TRUE").upper() == "FALSE":
+                continue
+            start_f = float(ci.findtext("start", "0"))
+            end_f = float(ci.findtext("end", "0"))
+            in_f = float(ci.findtext("in", "0"))
+            dur_f = max(0.0, end_f - start_f)
+            file_el = ci.find("file")
+            purl = ""
+            if file_el is not None:
+                purl = file_el.findtext("pathurl", "") or file_url_map.get(file_el.get("id", ""), "")
+            cname = ci.findtext("name", "")
+            filename = _extract_filename_from_url(purl, cname)
+            dedup_key = (filename, round(start_f, 2), round(end_f, 2), round(in_f, 2))
+            if dedup_key in seen_audio_spans:
+                continue
+            seen_audio_spans.add(dedup_key)
+            total_frames = max(total_frames, int(round(end_f)))
+            clips.append({
+                "name": cname or filename,
+                "filename": filename,
+                "target_url": purl,
+                "timeline_start_f": start_f,
+                "timeline_end_f": end_f,
+                "timeline_dur_f": dur_f,
+                "src_in_f": in_f,
+                "rate": rate,
+                "effects": [],
+            })
+        if clips:
+            audio_tracks.append({"name": f"Audio {len(audio_tracks) + 1}", "clips": clips})
+
+    return _pair_matte_tracks_and_build_inputs(
+        video_tracks, audio_tracks, rate, total_frames, width, height, timeline_dir
+    )
+
+
 def _materialize_video_or_image(
     video_obj: Optional[Any],
     image_tensor: Optional[torch.Tensor],
     file_name: str,
     temp_dir: str,
     prefix: str,
+    extra_dirs: Optional[List[str]] = None,
 ) -> Optional[str]:
     if video_obj is not None:
-        if hasattr(video_obj, "get_stream_source"):
-            trim_win = video_obj.get_active_trim_window() if hasattr(video_obj, "get_active_trim_window") else (0.0, 0.0)
-            src = video_obj.get_stream_source()
-            if isinstance(src, str) and os.path.isfile(src) and trim_win == (0.0, 0.0):
-                return src
-        if hasattr(video_obj, "save_to"):
-            out_mp4 = os.path.join(temp_dir, f"{prefix}.mp4")
-            video_obj.save_to(out_mp4)
-            return out_mp4
-        if isinstance(video_obj, str) and os.path.isfile(video_obj):
-            return video_obj
+        if isinstance(video_obj, torch.Tensor):
+            image_tensor = video_obj
+            video_obj = None
+        else:
+            if hasattr(video_obj, "get_stream_source"):
+                trim_win = (
+                    video_obj.get_active_trim_window()
+                    if hasattr(video_obj, "get_active_trim_window")
+                    else (0.0, 0.0)
+                )
+                src = video_obj.get_stream_source()
+                if isinstance(src, str) and os.path.isfile(src) and trim_win == (0.0, 0.0):
+                    return src
+            if hasattr(video_obj, "save_to"):
+                out_mp4 = os.path.join(temp_dir, f"{prefix}.mp4")
+                video_obj.save_to(out_mp4)
+                return out_mp4
+            if isinstance(video_obj, str) and os.path.isfile(video_obj):
+                return video_obj
 
     if image_tensor is not None and isinstance(image_tensor, torch.Tensor) and image_tensor.numel() > 0:
         if image_tensor.shape[0] == 1 or Types is None:
@@ -273,419 +689,432 @@ def _materialize_video_or_image(
         else:
             out_mp4 = os.path.join(temp_dir, f"{prefix}.mp4")
             vid = InputImpl.VideoFromComponents(
-                Types.VideoComponents(images=image_tensor, frame_rate=Fraction(25))
+                Types.VideoComponents(images=image_tensor, frame_rate=Fraction(24))
             )
             vid.save_to(out_mp4)
             return out_mp4
 
-    return _resolve_input_file(file_name)
+    return _resolve_input_file(file_name, extra_dirs=extra_dirs)
 
 
 def _materialize_mask(
-    mask_tensor: Optional[torch.Tensor],
+    mask_input: Optional[Any],
     alpha_file_name: str,
     invert_mask: bool,
     temp_dir: str,
     prefix: str = "overlay_alpha",
-) -> Optional[str]:
-    if mask_tensor is not None and isinstance(mask_tensor, torch.Tensor) and mask_tensor.numel() > 0:
-        m = mask_tensor.detach().cpu()
-        if m.ndim == 2:
-            m = m.unsqueeze(0)
-        elif m.ndim == 4:
-            m = m[..., 0]
-        # Skip dummy 64x64 all-zero mask emitted by LoadImage when source image has no alpha channel
-        if m.shape[-2:] == (64, 64) and float(m.max().item()) == 0.0 and not invert_mask:
-            return _resolve_input_file(alpha_file_name)
+    extra_dirs: Optional[List[str]] = None,
+) -> Tuple[Optional[str], bool]:
+    if mask_input is not None:
+        if not isinstance(mask_input, torch.Tensor):
+            vid_path = _materialize_video_or_image(mask_input, None, "none", temp_dir, prefix, extra_dirs=extra_dirs)
+            if vid_path:
+                return vid_path, bool(invert_mask)
+        elif mask_input.numel() > 0:
+            m = mask_input.detach().cpu()
+            if m.ndim == 4 and m.shape[-1] in (3, 4):
+                img_path = _materialize_video_or_image(None, m, "none", temp_dir, prefix, extra_dirs=extra_dirs)
+                if img_path:
+                    return img_path, bool(invert_mask)
+            if m.ndim == 2:
+                m = m.unsqueeze(0)
+            elif m.ndim == 4:
+                m = m[..., 0]
+            if m.shape[-2:] == (64, 64) and float(m.max().item()) == 0.0 and not invert_mask:
+                resolved = _resolve_input_file(alpha_file_name, extra_dirs=extra_dirs)
+                return resolved, bool(invert_mask) if resolved else False
 
-        alpha = m[0].numpy() if invert_mask else (1.0 - m[0].numpy())
-        arr = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
-        out_png = os.path.join(temp_dir, f"{prefix}.png")
-        Image.fromarray(arr, mode="L").save(out_png)
-        return out_png
+            alpha = m if invert_mask else (1.0 - m)
+            if alpha.shape[0] > 1 and Types is not None:
+                rgb_batch = alpha.unsqueeze(-1).expand(-1, -1, -1, 3).contiguous()
+                vid_path = _materialize_video_or_image(None, rgb_batch, "none", temp_dir, prefix, extra_dirs=extra_dirs)
+                return vid_path, False
 
-    return _resolve_input_file(alpha_file_name)
+            arr = np.clip(alpha[0].numpy() * 255.0, 0, 255).astype(np.uint8)
+            out_png = os.path.join(temp_dir, f"{prefix}.png")
+            Image.fromarray(arr, mode="L").save(out_png)
+            return out_png, False
+
+    resolved = _resolve_input_file(alpha_file_name, extra_dirs=extra_dirs)
+    return resolved, bool(invert_mask) if resolved else False
 
 
 def _materialize_audio(
-    audio_obj: Optional[Dict[str, Any]],
+    audio_obj: Optional[Any],
     audio_file_name: str,
     temp_dir: str,
+    prefix: str = "audio_track",
+    extra_dirs: Optional[List[str]] = None,
 ) -> Optional[str]:
-    if audio_obj is not None and isinstance(audio_obj, dict) and "waveform" in audio_obj:
-        waveform = audio_obj["waveform"].detach().cpu()
-        sample_rate = int(audio_obj.get("sample_rate", 44100))
-        if waveform.ndim == 3:
-            waveform = waveform[0]
-        # waveform shape: [channels, samples]
-        pcm = np.clip(waveform.t().numpy(), -1.0, 1.0)
-        pcm_int16 = (pcm * 32767.0).astype(np.int16)
-        channels = pcm_int16.shape[1] if pcm_int16.ndim == 2 else 1
-        out_wav = os.path.join(temp_dir, "audio_track.wav")
-        with wave.open(out_wav, "wb") as wf:
-            wf.setnchannels(channels)
-            wf.setsampwidth(2)
-            wf.setframerate(sample_rate)
-            wf.writeframes(pcm_int16.tobytes())
-        return out_wav
+    if audio_obj is not None:
+        if isinstance(audio_obj, dict) and "waveform" in audio_obj:
+            waveform = audio_obj["waveform"].detach().cpu()
+            sample_rate = int(audio_obj.get("sample_rate", 44100))
+            if waveform.ndim == 3:
+                waveform = waveform[0]
+            pcm = np.clip(waveform.t().numpy(), -1.0, 1.0)
+            pcm_int16 = (pcm * 32767.0).astype(np.int16)
+            channels = pcm_int16.shape[1] if pcm_int16.ndim == 2 else 1
+            out_wav = os.path.join(temp_dir, f"{prefix}.wav")
+            with wave.open(out_wav, "wb") as wf:
+                wf.setnchannels(channels)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(pcm_int16.tobytes())
+            return out_wav
+        vid_path = _materialize_video_or_image(audio_obj, None, "none", temp_dir, prefix, extra_dirs=extra_dirs)
+        if vid_path:
+            return vid_path
 
-    return _resolve_input_file(audio_file_name)
+    return _resolve_input_file(audio_file_name, extra_dirs=extra_dirs)
 
 
-def execute_nle_render(
-    media_path: str,
+def _resolve_upstream_load_image_path(
+    input_name: str,
+    prompt: Optional[Dict[str, Any]],
+    unique_id: Optional[str],
+) -> Optional[str]:
+    if not prompt or not unique_id or str(unique_id) not in prompt:
+        return None
+    try:
+        node_inputs = prompt[str(unique_id)].get("inputs", {})
+        link = node_inputs.get(input_name)
+        if isinstance(link, list) and len(link) == 2:
+            src_node_id = str(link[0])
+            src_node = prompt.get(src_node_id, {})
+            if src_node.get("class_type") == "LoadImage":
+                img_name = src_node.get("inputs", {}).get("image")
+                if img_name and folder_paths.exists_annotated_filepath(img_name):
+                    return folder_paths.get_annotated_filepath(img_name)
+    except Exception:
+        pass
+    return None
+
+
+def execute_otio_timeline_render(
+    timeline_path: str,
     output_path: str,
-    overlay_path: Optional[str] = None,
-    overlay_alpha_path: Optional[str] = None,
-    endcard_path: Optional[str] = None,
-    audio_path: Optional[str] = None,
-    rotate_input: str = "0",
-    reverse: bool = False,
-    still_duration: float = 4.0,
-    endcard_duration: float = 4.0,
-    audio_backtime: bool = True,
-    audio_fade_frames: int = 6,
+    connected_inputs: Dict[str, Any],
+    temp_dir: str,
     hw_encoder: str = "auto",
+    invert_alpha_matte: bool = False,
+    prompt: Optional[Dict[str, Any]] = None,
+    unique_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     ffmpeg_bin = get_ffmpeg_bin()
-    ffprobe_bin = get_ffprobe_bin()
+    if not isinstance(hw_encoder, str) or hw_encoder not in ("auto", "nvenc", "rkmpp", "videotoolbox", "cpu"):
+        hw_encoder = "auto"
     actual_hw = detect_working_hw_encoder() if hw_encoder == "auto" else hw_encoder
-    rot_code = ROTATE_MAP.get(str(rotate_input), "0")
+    timeline_dir = os.path.dirname(os.path.realpath(timeline_path))
+    timeline = parse_nle_timeline(timeline_path)
 
-    width, height, fps, media_dur, is_image = probe_media_specs(
-        media_path, ffprobe_bin, still_duration=still_duration
-    )
-    media_has_audio = probe_has_audio(media_path, ffprobe_bin)
+    w = max(2, int(timeline["width"]) - (int(timeline["width"]) % 2))
+    h = max(2, int(timeline["height"]) - (int(timeline["height"]) % 2))
+    fps = float(timeline["rate"])
+    total_frames = int(timeline["total_frames"])
+    dur_s = float(timeline["duration_s"])
 
-    if rot_code in ("1", "3"):
-        width, height = height, width
+    # Support legacy media_video / media_image fallback onto the first V1 clip if present
+    if timeline["video_tracks"] and timeline["video_tracks"][0]["clips"]:
+        first_v1_name = timeline["video_tracks"][0]["clips"][0]["filename"]
+        if first_v1_name not in connected_inputs or connected_inputs[first_v1_name] is None:
+            for legacy_key in ("media_video", "media_image"):
+                if connected_inputs.get(legacy_key) is not None:
+                    connected_inputs[first_v1_name] = connected_inputs[legacy_key]
+                    break
 
-    # Ensure even dimensions for yuv420p H.264 encoders
-    width = max(2, width - (width % 2))
-    height = max(2, height - (height % 2))
+    raw_stdin_bytes: Optional[bytes] = None
+    raw_stdin_spec: Optional[Tuple[int, int, float]] = None
+    embedded_audio_fallback: Optional[str] = None
 
-    endcard_dur = 0.0
-    is_endcard_image = False
-    if endcard_path:
-        try:
-            _, _, _, endcard_dur, is_endcard_image = probe_media_specs(
-                endcard_path, ffprobe_bin, still_duration=endcard_duration
+    cmd_inputs: List[str] = [
+        "-f",
+        "lavfi",
+        "-i",
+        f"color=c=black:s={w}x{h}:r={fps}:d={dur_s:.6f}",
+    ]
+    input_idx = 1
+    filter_parts = ["[0:v]format=yuv420p[base0]"]
+    current_base = "base0"
+    overlay_idx = 0
+
+    def _add_video_or_image_input(clip_dict: Dict[str, Any], prefix: str) -> Tuple[int, bool]:
+        nonlocal input_idx, raw_stdin_bytes, raw_stdin_spec, embedded_audio_fallback
+        fn = clip_dict["filename"]
+        val = connected_inputs.get(fn)
+
+        # Direct in-memory pipe for the first unencoded VideoFromComponents input (e.g. MonolithFaceSwap)
+        if (
+            raw_stdin_bytes is None
+            and val is not None
+            and hasattr(InputImpl, "VideoFromComponents")
+            and isinstance(val, InputImpl.VideoFromComponents)
+            and hasattr(val, "get_components")
+        ):
+            comp = val.get_components()
+            frames_np = np.clip(comp.images.detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+            in_fps = float(comp.frame_rate) if comp.frame_rate else fps
+            raw_stdin_bytes = frames_np.tobytes()
+            raw_stdin_spec = (int(frames_np.shape[2]), int(frames_np.shape[1]), in_fps)
+            if comp.audio is not None and embedded_audio_fallback is None:
+                embedded_audio_fallback = _materialize_audio(comp.audio, "none", temp_dir, prefix="emb_audio")
+            cmd_inputs.extend([
+                "-f", "rawvideo",
+                "-vcodec", "rawvideo",
+                "-pix_fmt", "rgb24",
+                "-s", f"{raw_stdin_spec[0]}x{raw_stdin_spec[1]}",
+                "-r", str(raw_stdin_spec[2]),
+                "-i", "-",
+            ])
+            idx = input_idx
+            input_idx += 1
+            return idx, False
+
+        # Preserve RGBA transparency when an upstream LoadImage node is wired into an image clip socket
+        fpath = _resolve_upstream_load_image_path(fn, prompt, unique_id)
+        if not fpath:
+            fpath = _materialize_video_or_image(
+                val, None, fn, temp_dir, prefix, extra_dirs=[timeline_dir]
             )
-        except Exception:
-            endcard_dur = float(endcard_duration)
-            is_endcard_image = True
-
-    total_dur = media_dur + endcard_dur
-    fps_val = _parse_fps(fps)
-
-    inputs = [media_path]
-    filter_lines = []
-
-    if is_image:
-        media_filter = "[0:v]"
-        if rot_code == "1":
-            media_filter += "transpose=1,"
-        elif rot_code == "2":
-            media_filter += "transpose=1,transpose=1,"
-        elif rot_code == "3":
-            media_filter += "transpose=2,"
-        media_filter += f"scale={width}:{height},setsar=1[media_prep];"
-        filter_lines.append(media_filter)
-
-        input_idx = 1
-        if overlay_path:
-            inputs.append(overlay_path)
-            overlay_idx = input_idx
-            input_idx += 1
-            if overlay_alpha_path:
-                inputs.append(overlay_alpha_path)
-                alpha_idx = input_idx
-                input_idx += 1
-                filter_lines.append(f"[{alpha_idx}:v]scale={width}:{height},setsar=1[alpha_v];")
-                filter_lines.append(f"[{overlay_idx}:v]scale={width}:{height},setsar=1[overlay_v];")
-                filter_lines.append("[overlay_v][alpha_v]alphamerge[overlay_merged];")
-                filter_lines.append("[media_prep][overlay_merged]overlay=0:0[slide_single];")
-            else:
-                filter_lines.append(f"[{overlay_idx}:v]scale={width}:{height},setsar=1[overlay_v];")
-                filter_lines.append("[media_prep][overlay_v]overlay=0:0[slide_single];")
-            slide_src = "slide_single"
+        if not fpath:
+            raise ValueError(
+                f"Monolith NLE: missing media input for timeline clip '{fn}'. "
+                f"Connect an input to '{fn}' or place '{fn}' in ComfyUI/input/."
+            )
+        ext = os.path.splitext(fpath)[1].lower()
+        is_img = ext in IMAGE_EXTS
+        c_dur = clip_dict["timeline_dur_f"] / fps
+        if is_img:
+            cmd_inputs.extend(["-loop", "1", "-framerate", str(fps), "-t", f"{c_dur:.6f}", "-i", fpath])
         else:
-            slide_src = "media_prep"
-
-        media_frames = max(1, int(round(media_dur * fps_val)))
-        filter_lines.append(f"[{slide_src}]loop=loop={media_frames - 1}:size=1:start=0,fps={fps}[slide_v];")
-
-        if endcard_path:
-            inputs.append(endcard_path)
-            endcard_idx = input_idx
-            input_idx += 1
-            if is_endcard_image:
-                endcard_frames = max(1, int(round(endcard_dur * fps_val)))
-                filter_lines.append(
-                    f"[{endcard_idx}:v]scale={width}:{height},setsar=1,loop=loop={endcard_frames - 1}:size=1:start=0,fps={fps}[endcard_v];"
-                )
-            else:
-                filter_lines.append(f"[{endcard_idx}:v]scale={width}:{height},setsar=1,fps={fps}[endcard_v];")
-            filter_lines.append("[slide_v][endcard_v]concat=n=2:v=1:a=0[last_v];")
-        else:
-            filter_lines.append("[slide_v]null[last_v];")
-        last_v = "last_v"
-    else:
-        media_filter = "[0:v]"
-        if rot_code == "1":
-            media_filter += "transpose=1,"
-        elif rot_code == "2":
-            media_filter += "transpose=1,transpose=1,"
-        elif rot_code == "3":
-            media_filter += "transpose=2,"
-        if reverse:
-            media_filter += f"reverse,scale={width}:{height},setsar=1,fps={fps}[media_prep];"
-        else:
-            media_filter += f"scale={width}:{height},setsar=1,fps={fps}[media_prep];"
-        filter_lines.append(media_filter)
-
-        last_v = "media_prep"
-        input_idx = 1
-        if overlay_path:
-            inputs.append(overlay_path)
-            overlay_idx = input_idx
-            input_idx += 1
-            if overlay_alpha_path:
-                inputs.append(overlay_alpha_path)
-                alpha_idx = input_idx
-                input_idx += 1
-                filter_lines.append(f"[{alpha_idx}:v]scale={width}:{height},setsar=1[alpha_v];")
-                filter_lines.append(f"[{overlay_idx}:v]scale={width}:{height},setsar=1[overlay_v];")
-                filter_lines.append("[overlay_v][alpha_v]alphamerge[overlay_merged];")
-                filter_lines.append(f"[{last_v}][overlay_merged]overlay=0:0:eof_action=repeat[with_overlay];")
-            else:
-                filter_lines.append(f"[{overlay_idx}:v]scale={width}:{height},setsar=1[overlay_v];")
-                filter_lines.append(f"[{last_v}][overlay_v]overlay=0:0:eof_action=repeat[with_overlay];")
-            last_v = "with_overlay"
-
-        if endcard_path:
-            inputs.append(endcard_path)
-            endcard_idx = input_idx
-            input_idx += 1
-            if is_endcard_image:
-                endcard_frames = max(1, int(round(endcard_dur * fps_val)))
-                filter_lines.append(
-                    f"[{endcard_idx}:v]scale={width}:{height},setsar=1,loop=loop={endcard_frames - 1}:size=1:start=0,fps={fps}[endcard_v];"
-                )
-            else:
-                filter_lines.append(f"[{endcard_idx}:v]scale={width}:{height},setsar=1,fps={fps}[endcard_v];")
-            filter_lines.append(f"[{last_v}][endcard_v]concat=n=2:v=1:a=0[concat_v];")
-            last_v = "concat_v"
-
-    has_audio = False
-    audio_mode = "none"
-    audio_raw_dur = 0.0
-    if audio_path:
-        inputs.append(audio_path)
-        audio_idx = input_idx
+            cmd_inputs.extend(["-i", fpath])
+        idx = input_idx
         input_idx += 1
-        cmd_a = [ffprobe_bin, "-v", "error", "-show_entries", "format=duration", "-of", "json", audio_path]
-        r_a = subprocess.run(cmd_a, capture_output=True, text=True)
-        try:
-            audio_raw_dur = float(json.loads(r_a.stdout)["format"]["duration"])
-        except Exception:
-            audio_raw_dur = total_dur
+        return idx, is_img
 
-        if audio_backtime and audio_raw_dur > total_dur:
-            trim_start = audio_raw_dur - total_dur
-            fade_dur = max(0.0, float(audio_fade_frames) / fps_val)
-            if fade_dur > 0:
-                filter_lines.append(
-                    f"[{audio_idx}:a]atrim=start={trim_start:.3f},asetpts=PTS-STARTPTS,afade=t=in:st=0:d={fade_dur:.3f}[audio_out]"
+    for t_idx, track in enumerate(timeline["video_tracks"]):
+        for c_idx, clip in enumerate(track["clips"]):
+            t_start = clip["timeline_start_f"] / fps
+            t_end = clip["timeline_end_f"] / fps
+            c_dur = clip["timeline_dur_f"] / fps
+            src_in = clip["src_in_f"] / fps
+
+            clip_in_idx, is_image = _add_video_or_image_input(clip, f"v_{t_idx}_{c_idx}")
+            eff_src_in = 0.0 if is_image else src_in
+
+            matte = clip.get("matte_clip")
+            if matte:
+                m_fn = matte["filename"]
+                m_val = connected_inputs.get(m_fn)
+                mpath, inv_matte = _materialize_mask(
+                    m_val,
+                    m_fn,
+                    invert_alpha_matte,
+                    temp_dir,
+                    prefix=f"m_{t_idx}_{c_idx}",
+                    extra_dirs=[timeline_dir],
+                )
+                if not mpath:
+                    raise ValueError(
+                        f"Monolith NLE: missing alpha matte input '{m_fn}' for clip '{clip['filename']}'."
+                    )
+                m_ext = os.path.splitext(mpath)[1].lower()
+                m_is_img = m_ext in IMAGE_EXTS
+                m_dur = matte["timeline_dur_f"] / fps
+                m_src_in = 0.0 if m_is_img else (matte["src_in_f"] / fps)
+                if m_is_img:
+                    cmd_inputs.extend(["-loop", "1", "-framerate", str(fps), "-t", f"{m_dur:.6f}", "-i", mpath])
+                else:
+                    cmd_inputs.extend(["-i", mpath])
+                matte_in_idx = input_idx
+                input_idx += 1
+                neg_str = ",negate" if inv_matte else ""
+
+                filter_parts.append(
+                    f"[{clip_in_idx}:v]trim=start={eff_src_in:.6f}:duration={c_dur:.6f},"
+                    f"setpts=PTS-STARTPTS,fps={fps},scale={w}:{h},setsar=1,format=rgba[vfill_{overlay_idx}]"
+                )
+                filter_parts.append(
+                    f"[{matte_in_idx}:v]trim=start={m_src_in:.6f}:duration={m_dur:.6f},"
+                    f"setpts=PTS-STARTPTS,fps={fps},scale={w}:{h},setsar=1,format=gray{neg_str}[vmatte_{overlay_idx}]"
+                )
+                filter_parts.append(
+                    f"[vfill_{overlay_idx}][vmatte_{overlay_idx}]alphamerge,"
+                    f"setpts=PTS+{t_start:.6f}/TB[vlayer_{overlay_idx}]"
                 )
             else:
-                filter_lines.append(f"[{audio_idx}:a]atrim=start={trim_start:.3f},asetpts=PTS-STARTPTS[audio_out]")
-            audio_mode = "backtimed"
-        else:
-            filter_lines.append(f"[{audio_idx}:a]anull[audio_out]")
-            audio_mode = "external"
-        has_audio = True
-    elif media_has_audio:
-        if reverse:
-            filter_lines.append("[0:a]areverse[audio_out]")
-            audio_mode = "embedded_reversed"
-        else:
-            filter_lines.append("[0:a]anull[audio_out]")
-            audio_mode = "embedded"
-        audio_raw_dur = media_dur
-        has_audio = True
+                pix_fmt = "rgba" if is_image else "yuv420p"
+                filter_parts.append(
+                    f"[{clip_in_idx}:v]trim=start={eff_src_in:.6f}:duration={c_dur:.6f},"
+                    f"setpts=PTS-STARTPTS,fps={fps},scale={w}:{h},setsar=1,format={pix_fmt},"
+                    f"setpts=PTS+{t_start:.6f}/TB[vlayer_{overlay_idx}]"
+                )
 
-    if filter_lines[-1].endswith(";"):
-        filter_lines[-1] = filter_lines[-1][:-1]
-    filter_complex = " ".join(filter_lines)
+            next_base = f"base{overlay_idx + 1}"
+            filter_parts.append(
+                f"[{current_base}][vlayer_{overlay_idx}]overlay=0:0:"
+                f"enable='between(t,{t_start:.6f},{t_end:.6f})':eof_action=pass[{next_base}]"
+            )
+            current_base = next_base
+            overlay_idx += 1
 
-    cmd = [ffmpeg_bin, "-y"]
-    for p in inputs:
-        cmd += ["-i", p]
+    audio_labels: List[str] = []
+    for a_t_idx, atrack in enumerate(timeline["audio_tracks"]):
+        for a_c_idx, aclip in enumerate(atrack["clips"]):
+            a_fn = aclip["filename"]
+            a_val = connected_inputs.get(a_fn)
+            if a_val is None and connected_inputs.get("audio") is not None:
+                a_val = connected_inputs["audio"]
+            apath = _materialize_audio(
+                a_val,
+                a_fn,
+                temp_dir,
+                prefix=f"a_{a_t_idx}_{a_c_idx}",
+                extra_dirs=[timeline_dir],
+            )
+            if not apath and embedded_audio_fallback:
+                apath = embedded_audio_fallback
+            if not apath:
+                continue
 
-    cmd += ["-filter_complex", filter_complex, "-map", f"[{last_v}]"]
+            cmd_inputs.extend(["-i", apath])
+            a_idx = input_idx
+            input_idx += 1
+            a_src_in = aclip["src_in_f"] / fps
+            a_dur = aclip["timeline_dur_f"] / fps
+            a_delay_ms = int(round((aclip["timeline_start_f"] / fps) * 1000.0))
+            alabel = f"aud_{len(audio_labels)}"
+            filter_parts.append(
+                f"[{a_idx}:a]atrim=start={a_src_in:.6f}:duration={a_dur:.6f},"
+                f"asetpts=PTS-STARTPTS,adelay={a_delay_ms}|{a_delay_ms},"
+                f"apad=whole_dur={dur_s:.6f},asetpts=N/SR/TB[{alabel}]"
+            )
+            audio_labels.append(alabel)
+
+    has_audio = len(audio_labels) > 0
+    if len(audio_labels) == 1:
+        audio_map_label = f"[{audio_labels[0]}]"
+    elif len(audio_labels) > 1:
+        mix_in = "".join(f"[{lbl}]" for lbl in audio_labels)
+        filter_parts.append(
+            f"{mix_in}amix=inputs={len(audio_labels)}:duration=first:dropout_transition=0,asetpts=N/SR/TB[aout_mix]"
+        )
+        audio_map_label = "[aout_mix]"
+    else:
+        audio_map_label = ""
+
+    cmd = [ffmpeg_bin, "-y"] + cmd_inputs + [
+        "-filter_complex", ";".join(filter_parts),
+        "-map", f"[{current_base}]",
+    ]
     if has_audio:
-        cmd += ["-map", "[audio_out]", "-c:a", "aac", "-b:a", "192k"]
-
-    cmd += ["-t", f"{total_dur:.6f}"]
+        cmd.extend(["-map", audio_map_label, "-c:a", "aac", "-b:a", "192k"])
 
     if actual_hw == "nvenc":
-        cmd += [
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p1",
-            "-b:v",
-            "10M",
-            "-maxrate",
-            "12M",
-            "-bufsize",
-            "20M",
-            "-profile:v",
-            "high",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            output_path,
-        ]
+        cmd.extend([
+            "-c:v", "h264_nvenc",
+            "-preset", "p1",
+            "-b:v", "10M",
+            "-maxrate", "12M",
+            "-bufsize", "20M",
+            "-profile:v", "high",
+            "-pix_fmt", "yuv420p",
+        ])
     elif actual_hw in ("videotoolbox", "rkmpp"):
-        cmd += [
-            "-c:v",
-            f"h264_{actual_hw}",
-            "-b:v",
-            "10M",
-            "-maxrate",
-            "12M",
-            "-bufsize",
-            "20M",
-            "-profile:v",
-            "high",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            output_path,
-        ]
+        cmd.extend([
+            "-c:v", f"h264_{actual_hw}",
+            "-b:v", "10M",
+            "-maxrate", "12M",
+            "-bufsize", "20M",
+            "-profile:v", "high",
+            "-pix_fmt", "yuv420p",
+        ])
     else:
-        cmd += [
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-b:v",
-            "10M",
-            "-maxrate",
-            "12M",
-            "-bufsize",
-            "20M",
-            "-profile:v",
-            "high",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            output_path,
-        ]
+        cmd.extend([
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-b:v", "10M",
+            "-maxrate", "12M",
+            "-bufsize", "20M",
+            "-profile:v", "high",
+            "-pix_fmt", "yuv420p",
+        ])
 
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        raise RuntimeError(f"Monolith NLE FFmpeg render failed ({actual_hw}): {res.stderr[-600:]}")
+    cmd.extend([
+        "-r", str(fps),
+        "-frames:v", str(total_frames),
+        "-movflags", "+faststart",
+        output_path,
+    ])
 
-    thumb_ts = min(2.0, media_dur / 2.0) if media_dur > 0 else 0.0
+    if raw_stdin_bytes is not None:
+        res = subprocess.run(cmd, input=raw_stdin_bytes, capture_output=True)
+        if res.returncode != 0:
+            err_txt = res.stderr.decode("utf-8", errors="replace")[-600:]
+            raise RuntimeError(f"Monolith NLE OTIO FFmpeg render failed ({actual_hw}): {err_txt}")
+    else:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"Monolith NLE OTIO FFmpeg render failed ({actual_hw}): {res.stderr[-600:]}")
+
+    thumb_ts = min(2.0, dur_s / 2.0) if dur_s > 0 else 0.0
     return {
-        "width": width,
-        "height": height,
-        "fps": round(fps_val, 2),
-        "media_dur": round(media_dur, 2),
-        "endcard_dur": round(endcard_dur, 2),
-        "total_dur": round(total_dur, 2),
-        "is_image": is_image,
-        "has_overlay": bool(overlay_path),
-        "has_alpha": bool(overlay_alpha_path),
-        "has_endcard": bool(endcard_path),
-        "audio_mode": audio_mode,
-        "audio_dur": round(audio_raw_dur, 2),
+        "mode": "otio",
+        "timeline_file": os.path.basename(timeline_path),
+        "width": w,
+        "height": h,
+        "fps": round(fps, 2),
+        "total_frames": total_frames,
+        "media_dur": round(dur_s, 2),
+        "endcard_dur": 0.0,
+        "total_dur": round(dur_s, 2),
         "hw_encoder": actual_hw,
-        "rotate_input": rotate_input,
-        "reverse": reverse,
         "thumb_ts": round(thumb_ts, 2),
+        "ui_tracks": timeline["ui_tracks"],
+        "inputs": timeline["inputs"],
     }
 
 
-def _shared_all_in_one_input_types() -> Dict[str, Any]:
-    media_files = ["none"] + get_input_media_files()
-    audio_files = ["none"] + get_input_audio_files()
+def _shared_otio_input_types() -> Dict[str, Any]:
+    timeline_files = get_timeline_files()
+    default_tl = (
+        "dutton_ranch_premiere.otio"
+        if "dutton_ranch_premiere.otio" in timeline_files
+        else (timeline_files[0] if timeline_files else "none")
+    )
     return {
         "required": {
-            "rotate_input": (["0", "90CW", "180", "270CW"], {"default": "0"}),
-            "reverse": ("BOOLEAN", {"default": False}),
-            "still_duration": ("FLOAT", {"default": 4.0, "min": 0.5, "max": 60.0, "step": 0.5}),
-            "endcard_duration": ("FLOAT", {"default": 4.0, "min": 0.5, "max": 60.0, "step": 0.5}),
-            "invert_overlay_mask": ("BOOLEAN", {"default": False}),
+            "timeline_file": (timeline_files, {"default": default_tl}),
             "hw_encoder": (["auto", "nvenc", "rkmpp", "videotoolbox", "cpu"], {"default": "auto"}),
+            "invert_alpha_matte": ("BOOLEAN", {"default": False}),
         },
-        "optional": {
-            "media_video": ("VIDEO",),
-            "media_image": ("IMAGE",),
-            "overlay_video": ("VIDEO",),
-            "overlay_image": ("IMAGE",),
-            "overlay_mask": ("MASK",),
-            "endcard_video": ("VIDEO",),
-            "endcard_image": ("IMAGE",),
-            "audio": ("AUDIO",),
-            "media_file": (media_files, {"default": "none"}),
-            "overlay_file": (media_files, {"default": "none"}),
-            "overlay_alpha_file": (media_files, {"default": "none"}),
-            "endcard_file": (media_files, {"default": "none"}),
-            "audio_file": (audio_files, {"default": "none"}),
+        "optional": _FlexibleOptionalDict(),
+        "hidden": {
+            "prompt": "PROMPT",
+            "unique_id": "UNIQUE_ID",
         },
     }
 
 
-def _run_assembler_common(
-    rotate_input: str = "0",
-    reverse: bool = False,
-    still_duration: float = 4.0,
-    endcard_duration: float = 4.0,
-    invert_overlay_mask: bool = False,
+def _run_otio_assembler(
+    timeline_file: str = "none",
     hw_encoder: str = "auto",
-    media_video: Optional[Any] = None,
-    media_image: Optional[torch.Tensor] = None,
-    overlay_video: Optional[Any] = None,
-    overlay_image: Optional[torch.Tensor] = None,
-    overlay_mask: Optional[torch.Tensor] = None,
-    endcard_video: Optional[Any] = None,
-    endcard_image: Optional[torch.Tensor] = None,
-    audio: Optional[Dict[str, Any]] = None,
-    media_file: str = "none",
-    overlay_file: str = "none",
-    overlay_alpha_file: str = "none",
-    endcard_file: str = "none",
-    audio_file: str = "none",
-    audio_backtime: bool = True,
-    audio_fade_frames: int = 6,
-):
+    invert_alpha_matte: bool = False,
+    prompt: Optional[Dict[str, Any]] = None,
+    unique_id: Optional[str] = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    timeline_path = _resolve_timeline_file(timeline_file)
+    if not timeline_path:
+        raise ValueError(
+            f"Monolith NLE Assembler: select a valid .otio or .xml timeline_file (got '{timeline_file}')."
+        )
+
     temp_root = folder_paths.get_temp_directory()
     os.makedirs(temp_root, exist_ok=True)
-    temp_dir = tempfile.mkdtemp(prefix="monolith_nle_", dir=temp_root)
+    temp_dir = tempfile.mkdtemp(prefix="monolith_nle_otio_", dir=temp_root)
 
     try:
-        media_path = _materialize_video_or_image(media_video, media_image, media_file, temp_dir, "media")
-        if not media_path:
-            raise ValueError(
-                "Monolith NLE Assembler: provide a base media input (media_video, media_image, or media_file)."
-            )
-
-        overlay_path = _materialize_video_or_image(overlay_video, overlay_image, overlay_file, temp_dir, "overlay")
-        overlay_alpha_path = (
-            _materialize_mask(overlay_mask, overlay_alpha_file, invert_overlay_mask, temp_dir)
-            if overlay_path
-            else None
-        )
-        endcard_path = _materialize_video_or_image(endcard_video, endcard_image, endcard_file, temp_dir, "endcard")
-        audio_path = _materialize_audio(audio, audio_file, temp_dir)
-
         full_out_dir, base_fn, counter, subf, _ = folder_paths.get_save_image_path(
             "monolith_nle", folder_paths.get_output_directory()
         )
@@ -693,24 +1122,19 @@ def _run_assembler_common(
         out_video_fn = f"{base_fn}_{counter:05}_.mp4"
         out_video_path = os.path.join(full_out_dir, out_video_fn)
 
-        timeline_meta = execute_nle_render(
-            media_path=media_path,
+        timeline_meta = execute_otio_timeline_render(
+            timeline_path=timeline_path,
             output_path=out_video_path,
-            overlay_path=overlay_path,
-            overlay_alpha_path=overlay_alpha_path,
-            endcard_path=endcard_path,
-            audio_path=audio_path,
-            rotate_input=rotate_input,
-            reverse=reverse,
-            still_duration=still_duration,
-            endcard_duration=endcard_duration,
-            audio_backtime=audio_backtime,
-            audio_fade_frames=audio_fade_frames,
+            connected_inputs=kwargs,
+            temp_dir=temp_dir,
             hw_encoder=hw_encoder,
+            invert_alpha_matte=invert_alpha_matte,
+            prompt=prompt,
+            unique_id=unique_id,
         )
 
         thumb_path = os.path.join(temp_dir, "thumbnail.jpg")
-        if extract_middle_frame(out_video_path, thumb_path, media_dur=timeline_meta["media_dur"]):
+        if extract_middle_frame(out_video_path, thumb_path, media_dur=timeline_meta["total_dur"]):
             thumb_pil = Image.open(thumb_path).convert("RGB")
             thumb_tensor = torch.from_numpy(np.array(thumb_pil).astype(np.float32) / 255.0).unsqueeze(0)
         else:
@@ -734,12 +1158,16 @@ def _run_assembler_common(
 
 class MonolithNLEAssemblerV1:
     """
-    v1 (Option A): Single All-in-One NLE Assembler node.
+    OTIO / XML Timeline-driven NLE Assembler node.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
-        return _shared_all_in_one_input_types()
+        return _shared_otio_input_types()
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        return True
 
     RETURN_TYPES = ("VIDEO", "IMAGE")
     RETURN_NAMES = ("video", "thumbnail")
@@ -747,34 +1175,23 @@ class MonolithNLEAssemblerV1:
     FUNCTION = "assemble"
     CATEGORY = "Monolith/NLE"
 
-    def assemble(self, **kwargs):
-        return _run_assembler_common(**kwargs)
+    def assemble(self, timeline_file: str = "none", hw_encoder: str = "auto", invert_alpha_matte: bool = False, **kwargs):
+        return _run_otio_assembler(
+            timeline_file=timeline_file,
+            hw_encoder=hw_encoder,
+            invert_alpha_matte=invert_alpha_matte,
+            **kwargs,
+        )
 
 
-class MonolithNLEAssemblerV2:
+class MonolithNLEAssemblerV2(MonolithNLEAssemblerV1):
     """
-    v2 (Option B): Single All-in-One NLE Assembler node with interactive multi-track visual timeline canvas.
+    OTIO / XML Timeline-driven NLE Assembler node with interactive multi-track visual timeline canvas.
     """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return _shared_all_in_one_input_types()
-
-    RETURN_TYPES = ("VIDEO", "IMAGE")
-    RETURN_NAMES = ("video", "thumbnail")
-    OUTPUT_NODE = True
-    FUNCTION = "assemble"
-    CATEGORY = "Monolith/NLE"
-
-    def assemble(self, **kwargs):
-        return _run_assembler_common(**kwargs)
+    pass
 
 
 class MonolithNLEOverlayTrack:
-    """
-    v3 (Option C): Modular V2 Overlay Track builder node.
-    """
-
     @classmethod
     def INPUT_TYPES(cls):
         media_files = ["none"] + get_input_media_files()
@@ -786,7 +1203,7 @@ class MonolithNLEOverlayTrack:
             "optional": {
                 "overlay_video": ("VIDEO",),
                 "overlay_image": ("IMAGE",),
-                "overlay_mask": ("MASK",),
+                "overlay_mask": ("MASK,VIDEO,IMAGE",),
                 "overlay_file": (media_files, {"default": "none"}),
                 "overlay_alpha_file": (media_files, {"default": "none"}),
             },
@@ -797,34 +1214,11 @@ class MonolithNLEOverlayTrack:
     FUNCTION = "build_track"
     CATEGORY = "Monolith/NLE"
 
-    def build_track(
-        self,
-        enabled: bool = True,
-        invert_mask: bool = False,
-        overlay_video: Optional[Any] = None,
-        overlay_image: Optional[torch.Tensor] = None,
-        overlay_mask: Optional[torch.Tensor] = None,
-        overlay_file: str = "none",
-        overlay_alpha_file: str = "none",
-    ):
-        return (
-            {
-                "enabled": enabled,
-                "invert_mask": invert_mask,
-                "overlay_video": overlay_video,
-                "overlay_image": overlay_image,
-                "overlay_mask": overlay_mask,
-                "overlay_file": overlay_file,
-                "overlay_alpha_file": overlay_alpha_file,
-            },
-        )
+    def build_track(self, **kwargs):
+        return (kwargs,)
 
 
 class MonolithNLEEndcardTrack:
-    """
-    v3 (Option C): Modular V1 Endcard Track builder node.
-    """
-
     @classmethod
     def INPUT_TYPES(cls):
         media_files = ["none"] + get_input_media_files()
@@ -845,30 +1239,11 @@ class MonolithNLEEndcardTrack:
     FUNCTION = "build_track"
     CATEGORY = "Monolith/NLE"
 
-    def build_track(
-        self,
-        enabled: bool = True,
-        endcard_duration: float = 4.0,
-        endcard_video: Optional[Any] = None,
-        endcard_image: Optional[torch.Tensor] = None,
-        endcard_file: str = "none",
-    ):
-        return (
-            {
-                "enabled": enabled,
-                "endcard_duration": endcard_duration,
-                "endcard_video": endcard_video,
-                "endcard_image": endcard_image,
-                "endcard_file": endcard_file,
-            },
-        )
+    def build_track(self, **kwargs):
+        return (kwargs,)
 
 
 class MonolithNLEAudioTrack:
-    """
-    v3 (Option C): Modular A1 Audio Track builder node.
-    """
-
     @classmethod
     def INPUT_TYPES(cls):
         audio_files = ["none"] + get_input_audio_files()
@@ -889,96 +1264,47 @@ class MonolithNLEAudioTrack:
     FUNCTION = "build_track"
     CATEGORY = "Monolith/NLE"
 
-    def build_track(
-        self,
-        enabled: bool = True,
-        backtime: bool = True,
-        fade_in_frames: int = 6,
-        audio: Optional[Dict[str, Any]] = None,
-        audio_file: str = "none",
-    ):
-        return (
-            {
-                "enabled": enabled,
-                "backtime": backtime,
-                "fade_in_frames": fade_in_frames,
-                "audio": audio,
-                "audio_file": audio_file,
-            },
-        )
+    def build_track(self, **kwargs):
+        return (kwargs,)
 
 
-class MonolithNLEAssemblerV3:
+class MonolithNLEAssemblerV3(MonolithNLEAssemblerV1):
     """
-    v3 (Option C): Modular NLE Master Assembler node accepting track wires.
+    OTIO / XML Timeline-driven NLE Assembler (v3 alias).
     """
+    pass
 
-    @classmethod
-    def INPUT_TYPES(cls):
-        media_files = ["none"] + get_input_media_files()
-        return {
-            "required": {
-                "rotate_input": (["0", "90CW", "180", "270CW"], {"default": "0"}),
-                "reverse": ("BOOLEAN", {"default": False}),
-                "still_duration": ("FLOAT", {"default": 4.0, "min": 0.5, "max": 60.0, "step": 0.5}),
-                "hw_encoder": (["auto", "nvenc", "rkmpp", "videotoolbox", "cpu"], {"default": "auto"}),
-            },
-            "optional": {
-                "media_video": ("VIDEO",),
-                "media_image": ("IMAGE",),
-                "overlay_track": ("MONOLITH_NLE_OVERLAY",),
-                "endcard_track": ("MONOLITH_NLE_ENDCARD",),
-                "audio_track": ("MONOLITH_NLE_AUDIO",),
-                "media_file": (media_files, {"default": "none"}),
-            },
-        }
 
-    RETURN_TYPES = ("VIDEO", "IMAGE")
-    RETURN_NAMES = ("video", "thumbnail")
-    OUTPUT_NODE = True
-    FUNCTION = "assemble"
-    CATEGORY = "Monolith/NLE"
+# Register HTTP route for frontend dynamic socket & timeline discovery
+try:
+    from aiohttp import web
+    from server import PromptServer
 
-    def assemble(
-        self,
-        rotate_input: str = "0",
-        reverse: bool = False,
-        still_duration: float = 4.0,
-        hw_encoder: str = "auto",
-        media_video: Optional[Any] = None,
-        media_image: Optional[torch.Tensor] = None,
-        overlay_track: Optional[Dict[str, Any]] = None,
-        endcard_track: Optional[Dict[str, Any]] = None,
-        audio_track: Optional[Dict[str, Any]] = None,
-        media_file: str = "none",
-    ):
-        ov = overlay_track if (overlay_track and overlay_track.get("enabled", True)) else {}
-        ec = endcard_track if (endcard_track and endcard_track.get("enabled", True)) else {}
-        au = audio_track if (audio_track and audio_track.get("enabled", True)) else {}
-
-        return _run_assembler_common(
-            rotate_input=rotate_input,
-            reverse=reverse,
-            still_duration=still_duration,
-            endcard_duration=ec.get("endcard_duration", 4.0),
-            invert_overlay_mask=ov.get("invert_mask", False),
-            hw_encoder=hw_encoder,
-            media_video=media_video,
-            media_image=media_image,
-            overlay_video=ov.get("overlay_video"),
-            overlay_image=ov.get("overlay_image"),
-            overlay_mask=ov.get("overlay_mask"),
-            endcard_video=ec.get("endcard_video"),
-            endcard_image=ec.get("endcard_image"),
-            audio=au.get("audio"),
-            media_file=media_file,
-            overlay_file=ov.get("overlay_file", "none"),
-            overlay_alpha_file=ov.get("overlay_alpha_file", "none"),
-            endcard_file=ec.get("endcard_file", "none"),
-            audio_file=au.get("audio_file", "none"),
-            audio_backtime=au.get("backtime", True),
-            audio_fade_frames=au.get("fade_in_frames", 6),
-        )
+    if PromptServer.instance is not None:
+        @PromptServer.instance.routes.get("/monolith/nle/timeline_info")
+        async def get_nle_timeline_info(request):
+            filename = request.rel_url.query.get("file", "none")
+            tl_path = _resolve_timeline_file(filename)
+            if not tl_path:
+                return web.json_response({"valid": False, "error": f"Timeline not found: {filename}"})
+            try:
+                parsed = parse_nle_timeline(tl_path)
+                return web.json_response({
+                    "valid": True,
+                    "file": os.path.basename(tl_path),
+                    "width": parsed["width"],
+                    "height": parsed["height"],
+                    "fps": parsed["fps"],
+                    "total_frames": parsed["total_frames"],
+                    "total_dur": parsed["total_dur"],
+                    "inputs": parsed["inputs"],
+                    "ui_tracks": parsed["ui_tracks"],
+                })
+            except Exception as exc:
+                logger.exception("Monolith NLE: failed to parse timeline %s", filename)
+                return web.json_response({"valid": False, "error": str(exc)}, status=400)
+except Exception:
+    pass
 
 
 NLE_CLASS_MAPPINGS = {
@@ -991,9 +1317,9 @@ NLE_CLASS_MAPPINGS = {
 }
 
 NLE_NAME_MAPPINGS = {
-    "MonolithNLEAssemblerV1": "Monolith NLE Assembler v1 (All-in-One)",
-    "MonolithNLEAssemblerV2": "Monolith NLE Assembler v2 (Visual Timeline)",
-    "MonolithNLEAssemblerV3": "Monolith NLE Assembler v3 (Modular)",
+    "MonolithNLEAssemblerV1": "Monolith NLE Assembler v1 (OTIO Timeline)",
+    "MonolithNLEAssemblerV2": "Monolith NLE Assembler v2 (OTIO Visual Timeline)",
+    "MonolithNLEAssemblerV3": "Monolith NLE Assembler v3 (OTIO Modular)",
     "MonolithNLEOverlayTrack": "Monolith NLE Overlay Track (v3)",
     "MonolithNLEEndcardTrack": "Monolith NLE Endcard Track (v3)",
     "MonolithNLEAudioTrack": "Monolith NLE Audio Track (v3)",
