@@ -15,12 +15,16 @@ comfyui-monolith-nodes/
 │   ├── pp_fastfaceswap_engine.py
 │   ├── pp_fastfaceswap_models.py
 │   └── facefusion/             # Bundled FaceFusion core helpers
+├── web/
+│   └── js/
+│       └── monolith_nle.js     # Interactive NLE timeline canvas & video player widget
 └── nodes/
     ├── __init__.py             # Merges domain NODE_CLASS_MAPPINGS
     ├── depth.py                # Monolith/Depth nodes
     ├── safety.py               # Monolith/Safety nodes
     ├── faceswap.py             # Monolith/FaceSwap nodes
-    └── prompt.py               # Monolith/Prompt nodes
+    ├── prompt.py               # Monolith/Prompt nodes
+    └── nle.py                  # Monolith/NLE timeline assembly nodes
 ```
 
 ### Adding a New Node Domain
@@ -46,3 +50,8 @@ comfyui-monolith-nodes/
 ### `Monolith/Prompt`
 - **Monolith Prompt Switch By Image (`MonolithPromptSwitchByImage`)**: Walks upstream from an `IMAGE` input wire to resolve the source filename (e.g. from `LoadImage`) and outputs the prompt matching `[filename.png]`, `[stem]`, or `[default]`.
 - **Monolith Image Switch By Image (`MonolithImageSwitchByImage`)**: Patch-bay image router using native ComfyUI V3 `Autogrow` slots (`image1..N` and `image1_output..N_output`). Matches the input image against connected candidate images by upstream filename (with pixel-tensor fallback) and outputs `(IMAGE, MASK, detected_filename)` for the winning `imageN_output` (or `default_image`), automatically extracting the upstream `LoadImage` alpha mask without extra mask inputs.
+
+### `Monolith/NLE`
+- **Monolith NLE Assembler v1 (`MonolithNLEAssemblerV1`)**: All-in-one FFmpeg NLE timeline composer (base media + alpha overlay + endcard concat + backtimed/faded audio + hardware encoding via `nvenc`/`rkmpp`/`videotoolbox` + midpoint thumbnail extraction).
+- **Monolith NLE Assembler v2 (`MonolithNLEAssemblerV2`)**: All-in-one NLE Assembler with an interactive HTML5 multi-track timeline canvas (`V2 OVR`, `V1 VID`, `A1 AUD`) and inline video preview widget.
+- **Monolith NLE Assembler v3 (`MonolithNLEAssemblerV3`) & Track Builders (`MonolithNLEOverlayTrack`, `MonolithNLEEndcardTrack`, `MonolithNLEAudioTrack`)**: Modular multi-node NLE timeline architecture accepting dedicated track wires (`MONOLITH_NLE_OVERLAY`, `MONOLITH_NLE_ENDCARD`, `MONOLITH_NLE_AUDIO`).
