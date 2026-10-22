@@ -307,6 +307,14 @@ MODEL_REGISTRY: Dict[str, Dict] = {
         "license": "MIT",
         "required": True,
     },
+    "xseg_1": {
+        "filename": "xseg_1.onnx",
+        "url": github_url("models-3.1.0", "xseg_1.onnx"),
+        "type": "occluder",
+        "size": (256, 256),
+        "license": "GPL-3.0",
+        "required": True,
+    },
     "fairface": {
         "filename": "fairface.onnx",
         "url": github_url("models-3.0.0", "fairface.onnx"),
@@ -324,7 +332,7 @@ MODEL_REGISTRY: Dict[str, Dict] = {
 }
 
 # Default models to use (Dune 3.0.1 baseline)
-DEFAULT_SWAP_MODEL = "inswapper_128_fp16"
+DEFAULT_SWAP_MODEL = "hyperswap_1a_256"
 DEFAULT_ENHANCE_MODEL = "gfpgan_1.4"
 
 # Required models that must always be present

@@ -287,7 +287,7 @@ def extract_middle_frame(video_path: str, thumb_path: str, media_dur: Optional[f
             data = json.loads(r.stdout)
             duration = float(data.get("format", {}).get("duration", 0.0))
 
-        timestamp = min(2.0, duration / 2.0) if duration > 0 else 0.0
+        timestamp = (duration / 2.0) if duration > 0 else 0.0
         cmd_extract = [
             ffmpeg_bin,
             "-y",

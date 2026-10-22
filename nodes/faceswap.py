@@ -116,9 +116,9 @@ class MonolithFaceSwapLoader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "swap_model": (list_available_swap_models(), {"default": "inswapper_128_fp16"}),
+                "swap_model": (list_available_swap_models(), {"default": "hyperswap_1a_256"}),
                 "enhance_model": (["none"] + list_available_enhance_models(), {"default": "gfpgan_1.4"}),
-                "pixel_boost": (["none", "128x128", "256x256", "384x384", "512x512"], {"default": "128x128"}),
+                "pixel_boost": (["none", "128x128", "256x256", "384x384", "512x512"], {"default": "256x256"}),
                 "provider": (["cuda", "cpu"], {"default": "cuda"}),
             }
         }
@@ -160,14 +160,14 @@ class MonolithFaceSwap:
                 "image_file": (["none"] + images, {"default": "none"}),
                 "video_file": (["none"] + videos, {"default": "none"}),
                 "engine": ("MONOLITH_FACESWAP_ENGINE",),
-                "swap_model": (list_available_swap_models(), {"default": "inswapper_128_fp16"}),
+                "swap_model": (list_available_swap_models(), {"default": "hyperswap_1a_256"}),
                 "enhance_model": (["none"] + list_available_enhance_models(), {"default": "gfpgan_1.4"}),
                 "enhancer_blend": ("INT", {"default": 80, "min": 0, "max": 100, "step": 1}),
                 "face_swapper_weight": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "pixel_boost": (["from_engine", "none", "128x128", "256x256", "384x384", "512x512"], {"default": "from_engine"}),
                 "face_selector_mode": (["reference", "one", "many"], {"default": "reference"}),
                 "face_selector_order": (["large-small", "left-right", "right-left", "top-bottom", "bottom-top", "small-large", "best-worst", "worst-best"], {"default": "large-small"}),
-                "reference_face_distance": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "reference_face_distance": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.5, "step": 0.05}),
                 "mask_blur": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "mask_padding_preset": (presets, {"default": "none"}),
                 "mask_padding_top": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
@@ -204,7 +204,7 @@ class MonolithFaceSwap:
         pixel_boost: str = "from_engine",
         face_selector_mode: str = "reference",
         face_selector_order: str = "large-small",
-        reference_face_distance: float = 0.6,
+        reference_face_distance: float = 0.3,
         mask_blur: float = 0.3,
         mask_padding_preset: str = "none",
         mask_padding_top: int = 0,
@@ -260,10 +260,9 @@ class MonolithFaceSwap:
             engine.pixel_boost = pixel_boost if pixel_boost != "none" else None
 
         src_frames = [(source_image[i].cpu().numpy() * 255.0).astype(np.uint8)[:, :, ::-1] for i in range(source_image.shape[0])]
-        source_faces = engine.sort_faces_by_order(engine.get_many_faces(src_frames), engine.face_selector_order)
-        if not source_faces:
+        source_face = engine.extract_source_face(src_frames)
+        if not source_face:
             raise ValueError("MonolithFaceSwap: No face found in source image!")
-        source_face = engine.get_average_face(source_faces)
         source_embedding = engine._prepare_source_embedding(source_face)
 
         ui_images = []
@@ -320,7 +319,7 @@ class MonolithFaceSwap:
             ref_face_img = None
             for i in range(actual_target_image.shape[0]):
                 frame_bgr = (actual_target_image[i].cpu().numpy() * 255.0).astype(np.uint8)[:, :, ::-1]
-                if i == 0 and engine.face_selector_mode == "reference":
+                if ref_face_img is None and engine.face_selector_mode == "reference":
                     f0_faces = engine.sort_faces_by_order(engine.get_many_faces([frame_bgr]), engine.face_selector_order)
                     ref_face_img = engine.get_one_face(f0_faces, 0)
                 result_bgr = engine.process_frame(
@@ -423,7 +422,7 @@ class MonolithFaceSwap:
             ref_face_vid = None
             for i in range(limit):
                 frame_bgr = (vid_images[i].cpu().numpy() * 255.0).astype(np.uint8)[:, :, ::-1]
-                if i == 0 and engine.face_selector_mode == "reference":
+                if ref_face_vid is None and engine.face_selector_mode == "reference":
                     f0_faces = engine.sort_faces_by_order(engine.get_many_faces([frame_bgr]), engine.face_selector_order)
                     ref_face_vid = engine.get_one_face(f0_faces, 0)
                 result_bgr = engine.process_frame(
@@ -522,11 +521,12 @@ class MonolithFaceEnhancer:
                 enhance_template = engine.enhancer_info.get("template", "ffhq_512")
 
                 crop, affine = engine.warp_face(temp_frame, face.landmark_set.get("5/68"), enhance_template, enhance_size)
+                occ_mask = engine.create_occlusion_mask(crop)
                 enhanced = engine._forward_enhancer(crop)
 
                 crop_size = (enhance_size[1], enhance_size[0])
                 box_mask = create_box_mask(crop_size, engine.mask_blur, [0, 0, 0, 0])
-                mask = np.expand_dims(box_mask, axis=-1)
+                mask = np.minimum(box_mask, occ_mask).clip(0, 1)
 
                 pasted = engine.paste_back(temp_frame, enhanced, mask, affine)
                 face_enhancer_blend = 1.0 - (blend / 100.0)

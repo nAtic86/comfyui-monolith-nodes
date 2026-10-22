@@ -252,7 +252,7 @@ class FastFaceSwapEngine:
         face_swapper_weight: float = 0.5,
         face_selector_mode: str = "reference",
         face_selector_order: str = "large-small",
-        reference_face_distance: float = 0.6,
+        reference_face_distance: float = 0.3,
     ):
         self.script_dir = _SCRIPT_DIR
         self.swap_model_name = swap_model
@@ -272,6 +272,7 @@ class FastFaceSwapEngine:
         self.initialized = False
         self.session = None
         self.enhancer_session = None
+        self.occluder_session = None
         self.embedding_converter_session = None  # For ghost/simswap models
         self.model_initializer = None  # For inswapper models
         self.model_info = None
@@ -449,6 +450,17 @@ class FastFaceSwapEngine:
                     else:
                         log("Enhancer not found, disabled", "WARN")
                         self.enhancer_session = None
+
+            # Load face occluder (xseg_1) for occlusion masking
+            occluder_path = get_model_path("xseg_1")
+            if occluder_path and occluder_path.exists():
+                log(f"Loading face occluder: {occluder_path.name}...")
+                occ_opts = onnxruntime.SessionOptions()
+                occ_opts.log_severity_level = 3
+                self.occluder_session = onnxruntime.InferenceSession(
+                    str(occluder_path), sess_options=occ_opts, providers=providers
+                )
+                log("Face occluder loaded: xseg_1")
             
             log("All models loaded successfully")
             self.initialized = True
@@ -526,8 +538,50 @@ class FastFaceSwapEngine:
             source_embedding = source_face.embedding.reshape((1, -1))
             return source_embedding / numpy.linalg.norm(source_embedding)
 
+    def extract_source_face(self, src_frames: List[numpy.ndarray]) -> Optional[Any]:
+        """Extract largest face per source frame before averaging (FaceFusion extract_source_face)."""
+        source_faces = []
+        for src_frame in src_frames:
+            temp_faces = self.get_many_faces([src_frame])
+            temp_faces = self.sort_faces_by_order(temp_faces, "large-small")
+            if temp_faces:
+                source_faces.append(temp_faces[0])
+        return self.get_average_face(source_faces) if source_faces else None
+
+    def extract_reference_face(self, video_face_data: List[Tuple[int, List[Any]]]) -> Optional[Any]:
+        """Select the medoid primary face across the video so intro/profile edge frames do not skew reference matching."""
+        primary_faces = []
+        order = self.face_selector_order or "large-small"
+        for _, faces in video_face_data:
+            if faces:
+                ordered = self.sort_faces_by_order(faces, order)
+                if ordered:
+                    primary_faces.append(ordered[0])
+        if not primary_faces:
+            return None
+        if len(primary_faces) == 1:
+            return primary_faces[0]
+        embs = numpy.stack([f.embedding_norm for f in primary_faces])
+        dist_matrix = 0.5 * (1.0 - (embs @ embs.T))
+        medoid_idx = int(numpy.argmin(dist_matrix.mean(axis=1)))
+        return primary_faces[medoid_idx]
+
+    def create_occlusion_mask(self, crop_vision_frame: numpy.ndarray) -> numpy.ndarray:
+        """Create face occlusion mask using xseg_1 matching FaceFusion face_masker.create_occlusion_mask."""
+        if self.occluder_session is None:
+            return numpy.ones(crop_vision_frame.shape[:2], dtype=numpy.float32)
+        model_size = (256, 256)
+        prepare_vision_frame = cv2.resize(crop_vision_frame, model_size)
+        prepare_vision_frame = numpy.expand_dims(prepare_vision_frame, axis=0).astype(numpy.float32) / 255.0
+        input_name = self.occluder_session.get_inputs()[0].name
+        temp_mask = self.occluder_session.run(None, {input_name: prepare_vision_frame})[0][0]
+        temp_mask = temp_mask.transpose(0, 1, 2).clip(0, 1).astype(numpy.float32)
+        temp_mask = cv2.resize(temp_mask, crop_vision_frame.shape[:2][::-1])
+        occlusion_mask = (cv2.GaussianBlur(temp_mask.clip(0, 1), (0, 0), 5).clip(0.5, 1) - 0.5) * 2
+        return occlusion_mask
+
     def select_target_faces(self, faces: List[Any], reference_face: Optional[Any] = None) -> List[Any]:
-        """Sort and filter target faces according to FaceFusion 3.0.1 face_selector rules."""
+        """Sort and filter target faces according to FaceFusion face_selector rules."""
         if not faces:
             return []
         ordered = self.sort_faces_by_order(faces, self.face_selector_order) if self.face_selector_order else faces
@@ -537,7 +591,11 @@ class FastFaceSwapEngine:
         if self.face_selector_mode == "reference":
             ref = reference_face if reference_face is not None else self.get_one_face(ordered, 0)
             if ref is not None:
-                return self.find_match_faces([ref], ordered, self.reference_face_distance)
+                matches = self.find_match_faces([ref], ordered, self.reference_face_distance)
+                if len(matches) > 1 and hasattr(ref, "embedding_norm"):
+                    matches.sort(key=lambda f: 1.0 - float(numpy.dot(f.embedding_norm, ref.embedding_norm)))
+                    return [matches[0]]
+                return matches
             return []
         return ordered
     
@@ -632,13 +690,12 @@ class FastFaceSwapEngine:
         model_template = self.model_info.get("template", "arcface_128")
         
         for target_face in faces:
-            # FaceFusion 3.0.1 uses pure source_embedding for inswapper (weight == 0 when face_swapper_weight == 0.5)
-            if abs(self.face_swapper_weight - 0.5) < 1e-4 or self.model_type == "inswapper":
+            if abs(self.face_swapper_weight - 0.5) < 1e-4:
                 blended_embedding = source_embedding.reshape(1, -1).astype(numpy.float32)
             else:
                 weight = numpy.interp(self.face_swapper_weight, [0, 1], [0.35, -0.35]).astype(numpy.float32)
                 target_embedding = target_face.embedding
-                if self.model_info.get("type") in ["hififace", "hyperswap", "simswap"]:
+                if self.model_info.get("type") in ["alphaface", "hififace", "hyperswap", "inswapper", "simswap"]:
                     target_embedding = target_embedding / numpy.linalg.norm(target_embedding)
                 blended_embedding = (source_embedding.reshape(1, -1) * (1 - weight) + target_embedding.reshape(1, -1) * weight).astype(numpy.float32)
             
@@ -659,6 +716,7 @@ class FastFaceSwapEngine:
                 model_template,
                 pixel_boost_size
             )
+            occlusion_mask = self.create_occlusion_mask(crop_frame)
             
             if pixel_boost_total > 1:
                 pixel_boost_vision_frames = self.implode_pixel_boost(crop_frame, pixel_boost_total, model_size)
@@ -695,17 +753,15 @@ class FastFaceSwapEngine:
             else:
                 result_crop_frame = temp_vision_frames[0]
             
-            # 6. Create mask (facefusion-compatible box mask with blur/padding)
+            # 6. Create combined box + occlusion mask
             crop_size = (pixel_boost_size[1], pixel_boost_size[0])  # (width, height)
             box_mask = create_box_mask(crop_size, self.mask_blur, self.mask_padding)
-            
-            # Expand dims for paste_back compatibility
-            mask = numpy.expand_dims(box_mask, axis=-1)
+            crop_mask = numpy.minimum(box_mask, occlusion_mask).clip(0, 1)
             
             # 7. Paste back swapped face
-            temp_frame = self.paste_back(temp_frame, result_crop_frame, mask, affine_matrix)
+            temp_frame = self.paste_back(temp_frame, result_crop_frame, crop_mask, affine_matrix)
         
-        # 8. Face Enhancement pass (FaceFusion 3.0.1 face_enhancer.py: (0,0,0,0) box mask padding + post-paste blend)
+        # 8. Face Enhancement pass (box + occlusion mask + post-paste blend)
         if enhance and self.enhancer_session and enhancer_blend > 0:
             for target_face in faces:
                 unenhanced_frame = temp_frame.copy()
@@ -719,12 +775,13 @@ class FastFaceSwapEngine:
                     enhance_template,
                     enhance_size
                 )
+                enhance_occlusion_mask = self.create_occlusion_mask(enhance_crop)
                 
                 enhanced_crop = self._forward_enhancer(enhance_crop)
                 
                 enhance_crop_size = (enhance_size[1], enhance_size[0])
                 enhance_box_mask = create_box_mask(enhance_crop_size, self.mask_blur, [0, 0, 0, 0])
-                enhance_mask = numpy.expand_dims(enhance_box_mask, axis=-1)
+                enhance_mask = numpy.minimum(enhance_box_mask, enhance_occlusion_mask).clip(0, 1)
                 
                 paste_vision_frame = self.paste_back(temp_frame, enhanced_crop, enhance_mask, enhance_affine_matrix)
                 
@@ -851,8 +908,7 @@ class FastFaceSwapEngine:
             if isinstance(source, numpy.ndarray) and source.ndim in (1, 2) and source.shape[-1] == 512:
                 source_embedding = source
             elif isinstance(source, numpy.ndarray) and source.ndim == 3:
-                source_faces = self.sort_faces_by_order(self.get_many_faces([source]), self.face_selector_order)
-                source_face = self.get_average_face(source_faces)
+                source_face = self.extract_source_face([source])
                 if not source_face:
                     return False, "No face found in source image"
                 source_embedding = self._prepare_source_embedding(source_face)
@@ -861,8 +917,7 @@ class FastFaceSwapEngine:
                     return False, f"Source not found: {source}"
                 log(f"Source: {os.path.basename(source)}")
                 src_frame = self.read_image(source)
-                source_faces = self.sort_faces_by_order(self.get_many_faces([src_frame]), self.face_selector_order)
-                source_face = self.get_average_face(source_faces)
+                source_face = self.extract_source_face([src_frame])
                 if not source_face:
                     return False, "No face found in source image"
                 log("Source face detected, preparing embedding...")
@@ -874,15 +929,10 @@ class FastFaceSwapEngine:
             video_face_data = self.analyze_video(target_path)
             video_face_map = {k: v for k, v in video_face_data}
             
-            # Extract reference face from reference_frame_number (frame 0, largest face per Dune 3.0.1)
+            # Extract medoid reference face across video frames
             reference_face = None
             if self.face_selector_mode == "reference":
-                ref_frame_faces = video_face_map.get(0)
-                if not ref_frame_faces and video_face_data:
-                    ref_frame_faces = video_face_data[0][1]
-                if ref_frame_faces:
-                    ordered_ref = self.sort_faces_by_order(ref_frame_faces, self.face_selector_order)
-                    reference_face = self.get_one_face(ordered_ref, 0)
+                reference_face = self.extract_reference_face(video_face_data)
             
             # 3. Setup video capture
             log(f"Opening target video: {os.path.basename(target_path)}")
@@ -1075,8 +1125,7 @@ class FastFaceSwapEngine:
             if isinstance(source, numpy.ndarray) and source.ndim in (1, 2) and source.shape[-1] == 512:
                 source_embedding = source
             elif isinstance(source, numpy.ndarray) and source.ndim == 3:
-                source_faces = self.sort_faces_by_order(self.get_many_faces([source]), self.face_selector_order)
-                source_face = self.get_average_face(source_faces)
+                source_face = self.extract_source_face([source])
                 if not source_face:
                     return None, 0.0, "No face found in source image"
                 source_embedding = self._prepare_source_embedding(source_face)
@@ -1084,8 +1133,7 @@ class FastFaceSwapEngine:
                 if not os.path.exists(source):
                     return None, 0.0, f"Source not found: {source}"
                 src_frame = self.read_image(source)
-                source_faces = self.sort_faces_by_order(self.get_many_faces([src_frame]), self.face_selector_order)
-                source_face = self.get_average_face(source_faces)
+                source_face = self.extract_source_face([src_frame])
                 if not source_face:
                     return None, 0.0, "No face found in source image"
                 source_embedding = self._prepare_source_embedding(source_face)
@@ -1097,12 +1145,7 @@ class FastFaceSwapEngine:
 
             reference_face = None
             if self.face_selector_mode == "reference":
-                ref_frame_faces = video_face_map.get(0)
-                if not ref_frame_faces and video_face_data:
-                    ref_frame_faces = video_face_data[0][1]
-                if ref_frame_faces:
-                    ordered_ref = self.sort_faces_by_order(ref_frame_faces, self.face_selector_order)
-                    reference_face = self.get_one_face(ordered_ref, 0)
+                reference_face = self.extract_reference_face(video_face_data)
 
             cap = cv2.VideoCapture(target_path)
             _active_captures.append(cap)
