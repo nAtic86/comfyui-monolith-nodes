@@ -165,6 +165,34 @@ DEFAULT_MASK_PADDING = [0, 0, 0, 0]  # [top, right, bottom, left] as percentage
 # ---------------------------------------------------------------------
 # MASK FUNCTIONS (matching facefusion/face_masker.py)
 # ---------------------------------------------------------------------
+_BOX_MASK_CACHE: dict = {}
+_ONNX_SESSION_CACHE: dict = {}
+_MODEL_INITIALIZER_CACHE: dict = {}
+_NVENC_AVAILABLE_CACHE: Optional[bool] = None
+
+
+def _provider_cache_key(providers: List[Any]) -> Tuple[Any, ...]:
+    key = []
+    for p in providers:
+        if isinstance(p, tuple) and len(p) == 2 and isinstance(p[1], dict):
+            key.append((str(p[0]), tuple(sorted((str(k), str(v)) for k, v in p[1].items()))))
+        else:
+            key.append(str(p))
+    return tuple(key)
+
+
+def _get_cached_onnx_session(model_path: str, providers: List[Any], sess_options: Optional[Any] = None):
+    cache_key = (str(model_path), _provider_cache_key(providers))
+    sess = _ONNX_SESSION_CACHE.get(cache_key)
+    if sess is None:
+        if sess_options is not None:
+            sess = onnxruntime.InferenceSession(str(model_path), sess_options=sess_options, providers=providers)
+        else:
+            sess = onnxruntime.InferenceSession(str(model_path), providers=providers)
+        _ONNX_SESSION_CACHE[cache_key] = sess
+    return sess
+
+
 def create_box_mask(crop_size: Tuple[int, int], blur: float = 0.3, 
                     padding: List[int] = None) -> numpy.ndarray:
     """
@@ -180,6 +208,11 @@ def create_box_mask(crop_size: Tuple[int, int], blur: float = 0.3,
     """
     if padding is None:
         padding = DEFAULT_MASK_PADDING
+
+    cache_key = (int(crop_size[0]), int(crop_size[1]), round(float(blur), 4), tuple(int(x) for x in padding))
+    cached = _BOX_MASK_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     
     width, height = crop_size
     blur_amount = int(width * 0.5 * blur)
@@ -213,19 +246,24 @@ def create_box_mask(crop_size: Tuple[int, int], blur: float = 0.3,
     if blur_amount > 0:
         box_mask = cv2.GaussianBlur(box_mask, (0, 0), blur_amount * 0.25)
     
+    _BOX_MASK_CACHE[cache_key] = box_mask
     return box_mask
 
 
 def check_nvenc_available() -> bool:
     """Check if NVENC GPU encoding is available."""
+    global _NVENC_AVAILABLE_CACHE
+    if _NVENC_AVAILABLE_CACHE is not None:
+        return _NVENC_AVAILABLE_CACHE
     try:
         result = subprocess.run(
             ['ffmpeg', '-hide_banner', '-encoders'],
             capture_output=True, text=True, timeout=5
         )
-        return 'h264_nvenc' in result.stdout
+        _NVENC_AVAILABLE_CACHE = 'h264_nvenc' in result.stdout
     except Exception:
-        return False
+        _NVENC_AVAILABLE_CACHE = False
+    return _NVENC_AVAILABLE_CACHE
 
 
 class FastFaceSwapEngine:
@@ -334,7 +372,9 @@ class FastFaceSwapEngine:
         
         # Monkey patch filesystem to redirect .assets/models to comfyui/models
         from facefusion import filesystem
-        original_resolve = filesystem.resolve_relative_path
+        if not hasattr(filesystem, '_monolith_orig_resolve'):
+            filesystem._monolith_orig_resolve = filesystem.resolve_relative_path
+        original_resolve = filesystem._monolith_orig_resolve
         def patched_resolve(path):
             if '.assets/models' in path:
                 basename = os.path.basename(path)
@@ -383,13 +423,12 @@ class FastFaceSwapEngine:
             self.model_type = self.model_info.get("type", "inswapper")
             log(f"  Model type: {self.model_type}")
             
-            from facefusion import inference_manager, logger, translator
-            from onnxruntime import InferenceSession
+            from facefusion import inference_manager
             def patched_create(model_path, execution_device_id, execution_providers):
                 from facefusion.execution import create_inference_providers
                 try:
                     inference_providers = create_inference_providers(execution_device_id, execution_providers)
-                    return InferenceSession(model_path, providers=inference_providers)
+                    return _get_cached_onnx_session(model_path, inference_providers)
                 except Exception as e:
                     import traceback
                     traceback.print_exc()
@@ -413,13 +452,16 @@ class FastFaceSwapEngine:
             
             log(f"Loading swap model: {swap_model_path.name}...")
             providers = self.create_providers(0, self.execution_providers)
-            self.session = onnxruntime.InferenceSession(str(swap_model_path), providers=providers)
+            self.session = _get_cached_onnx_session(str(swap_model_path), providers)
             log(f"Swap model loaded. Providers: {self.session.get_providers()}")
             
             # Load model initializer for inswapper type (embedding normalization matrix)
             if self.model_type == "inswapper":
-                model_proto = onnx.load(str(swap_model_path))
-                self.model_initializer = numpy_helper.to_array(model_proto.graph.initializer[-1])
+                swap_key = str(swap_model_path)
+                if swap_key not in _MODEL_INITIALIZER_CACHE:
+                    model_proto = onnx.load(swap_key)
+                    _MODEL_INITIALIZER_CACHE[swap_key] = numpy_helper.to_array(model_proto.graph.initializer[-1])
+                self.model_initializer = _MODEL_INITIALIZER_CACHE[swap_key]
                 log("Inswapper initializer loaded")
             
             # Load embedding converter for ghost/simswap types
@@ -428,8 +470,8 @@ class FastFaceSwapEngine:
                 converter_path = get_model_path(converter_name)
                 if converter_path and converter_path.exists():
                     log(f"Loading embedding converter: {converter_path.name}...")
-                    self.embedding_converter_session = onnxruntime.InferenceSession(
-                        str(converter_path), providers=providers
+                    self.embedding_converter_session = _get_cached_onnx_session(
+                        str(converter_path), providers
                     )
                     log(f"Embedding converter loaded: {converter_name}")
                 else:
@@ -442,8 +484,8 @@ class FastFaceSwapEngine:
                     enhance_path = get_model_path(self.enhance_model_name)
                     if enhance_path and enhance_path.exists():
                         log(f"Loading enhancer: {enhance_path.name}...")
-                        self.enhancer_session = onnxruntime.InferenceSession(
-                            str(enhance_path), providers=providers
+                        self.enhancer_session = _get_cached_onnx_session(
+                            str(enhance_path), providers
                         )
                         self.enhancer_info = get_model_info(self.enhance_model_name)
                         log(f"Enhancer loaded: {self.enhance_model_name}")
@@ -457,8 +499,8 @@ class FastFaceSwapEngine:
                 log(f"Loading face occluder: {occluder_path.name}...")
                 occ_opts = onnxruntime.SessionOptions()
                 occ_opts.log_severity_level = 3
-                self.occluder_session = onnxruntime.InferenceSession(
-                    str(occluder_path), sess_options=occ_opts, providers=providers
+                self.occluder_session = _get_cached_onnx_session(
+                    str(occluder_path), providers, sess_options=occ_opts
                 )
                 log("Face occluder loaded: xseg_1")
             
@@ -489,8 +531,8 @@ class FastFaceSwapEngine:
             enhance_path = get_model_path(self.enhance_model_name)
             if enhance_path and enhance_path.exists():
                 log(f"Loading enhancer: {enhance_path.name}...")
-                self.enhancer_session = onnxruntime.InferenceSession(
-                    str(enhance_path), providers=providers
+                self.enhancer_session = _get_cached_onnx_session(
+                    str(enhance_path), providers
                 )
                 self.enhancer_info = get_model_info(self.enhance_model_name)
                 log(f"Enhancer loaded: {self.enhance_model_name}")
@@ -635,7 +677,7 @@ class FastFaceSwapEngine:
         inputs = {self.enhancer_session.get_inputs()[0].name: input_frame}
         for inp in self.enhancer_session.get_inputs():
             if inp.name == 'weight':
-                inputs['weight'] = numpy.array([1.0]).astype(numpy.double)
+                inputs['weight'] = numpy.array([0.5]).astype(numpy.double)
                 
         output = self.enhancer_session.run(None, inputs)[0][0]
         
@@ -761,11 +803,10 @@ class FastFaceSwapEngine:
             # 7. Paste back swapped face
             temp_frame = self.paste_back(temp_frame, result_crop_frame, crop_mask, affine_matrix)
         
-        # 8. Face Enhancement pass (box + occlusion mask + post-paste blend)
+        # 8. Face Enhancement pass (box + occlusion mask + blend)
         if enhance and self.enhancer_session and enhancer_blend > 0:
+            blend_alpha = min(max(enhancer_blend / 100.0, 0.0), 1.0)
             for target_face in faces:
-                unenhanced_frame = temp_frame.copy()
-                
                 enhance_size = self.enhancer_info.get("size", (512, 512))
                 enhance_template = self.enhancer_info.get("template", "ffhq_512")
                 
@@ -782,11 +823,10 @@ class FastFaceSwapEngine:
                 enhance_crop_size = (enhance_size[1], enhance_size[0])
                 enhance_box_mask = create_box_mask(enhance_crop_size, self.mask_blur, [0, 0, 0, 0])
                 enhance_mask = numpy.minimum(enhance_box_mask, enhance_occlusion_mask).clip(0, 1)
+                if blend_alpha < 1.0:
+                    enhance_mask = enhance_mask * blend_alpha
                 
-                paste_vision_frame = self.paste_back(temp_frame, enhanced_crop, enhance_mask, enhance_affine_matrix)
-                
-                face_enhancer_blend = 1.0 - (enhancer_blend / 100.0)
-                temp_frame = cv2.addWeighted(unenhanced_frame, face_enhancer_blend, paste_vision_frame, 1.0 - face_enhancer_blend, 0)
+                temp_frame = self.paste_back(temp_frame, enhanced_crop, enhance_mask, enhance_affine_matrix)
         
         return temp_frame
     
@@ -796,13 +836,26 @@ class FastFaceSwapEngine:
         """
         cache_path = target_path + '.faces.pkl'
         
+        import hashlib
+        h = hashlib.sha1()
+        with open(target_path, 'rb') as vf:
+            for chunk in iter(lambda: vf.read(1 << 20), b''):
+                h.update(chunk)
+        sig = h.hexdigest()
+
         if os.path.exists(cache_path):
             log(f"Loading cached face data: {os.path.basename(cache_path)}")
             try:
                 with open(cache_path, 'rb') as f:
-                    data = pickle.load(f)
-                    log(f"Cache loaded: {len(data)} frames with faces")
-                    return data
+                    raw = pickle.load(f)
+                    if isinstance(raw, dict) and raw.get("sig") == sig:
+                        data = raw["faces"]
+                        log(f"Cache loaded: {len(data)} frames with faces")
+                        return data
+                    if isinstance(raw, list):
+                        log(f"Cache loaded (legacy list): {len(raw)} frames with faces")
+                        return raw
+                    log("Cache signature mismatch. Re-analyzing.", "WARN")
             except Exception as e:
                 log(f"Cache load failed: {e}. Re-analyzing.", "WARN")
         
@@ -845,7 +898,7 @@ class FastFaceSwapEngine:
         
         try:
             with open(cache_path, 'wb') as f:
-                pickle.dump(face_data, f)
+                pickle.dump({"sig": sig, "faces": face_data}, f)
             log(f"Analysis cached to {os.path.basename(cache_path)}")
         except Exception as e:
             log(f"Could not save cache: {e}", "WARN")

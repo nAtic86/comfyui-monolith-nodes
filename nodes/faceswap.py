@@ -52,6 +52,51 @@ def _extract_audio_from_file(video_path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+if hasattr(InputImpl, "VideoFromComponents"):
+    class _LazyRawVideoFromComponents(InputImpl.VideoFromComponents):
+        """Holds raw uint8 RGB frames for zero-copy NLE piping, materializing float32 VideoComponents only on demand."""
+
+        def __init__(
+            self,
+            rgb_frames: List[np.ndarray],
+            fps: float,
+            audio_source_path: Optional[str] = None,
+            audio_dict: Optional[Dict[str, Any]] = None,
+        ):
+            self._rgb_frames = rgb_frames
+            self._fps = float(fps)
+            self._audio_source_path = audio_source_path
+            self._audio_dict = audio_dict
+            self._lazy_components = None
+            self._VideoFromComponents__bit_depth = 8
+            self._VideoFromComponents__color_space = "sRGB"
+
+        def get_raw_rgb_stream(self):
+            h, w = self._rgb_frames[0].shape[:2]
+            raw_bytes = b"".join(np.ascontiguousarray(f).tobytes() for f in self._rgb_frames)
+            return raw_bytes, w, h, self._fps, self._audio_source_path, self._audio_dict
+
+        def _ensure_components(self):
+            if self._lazy_components is None:
+                frames_tensor = torch.from_numpy(np.stack(self._rgb_frames, axis=0)).to(dtype=torch.float32).div_(255.0)
+                audio = self._audio_dict if self._audio_dict is not None else (
+                    _extract_audio_from_file(self._audio_source_path) if self._audio_source_path else None
+                )
+                fps_frac = Fraction(max(1, round(self._fps * 1000)), 1000)
+                self._lazy_components = Types.VideoComponents(images=frames_tensor, audio=audio, frame_rate=fps_frac)
+                self._VideoFromComponents__components = self._lazy_components
+            return self._lazy_components
+
+        def get_components(self):
+            return self._ensure_components()
+
+        def save_to(self, *args, **kwargs):
+            self._ensure_components()
+            return super().save_to(*args, **kwargs)
+else:
+    _LazyRawVideoFromComponents = None
+
+
 def _get_engine_cls():
     from ..fastfacefusion.pp_fastfaceswap_engine import FastFaceSwapEngine, create_box_mask
     return FastFaceSwapEngine, create_box_mask
@@ -396,22 +441,21 @@ class MonolithFaceSwap:
                 if rgb_frames is None or len(rgb_frames) == 0:
                     raise RuntimeError(f"MonolithFaceSwap video frame processing failed: {err or 'No frames decoded'}")
 
-                frames_tensor = torch.from_numpy(np.stack(rgb_frames, axis=0)).to(dtype=torch.float32).div_(255.0)
-                if out_image is None:
-                    out_image = frames_tensor
-
                 mid_rgb = rgb_frames[len(rgb_frames) // 2]
+                if out_image is None:
+                    out_image = torch.from_numpy(mid_rgb.astype(np.float32) / 255.0).unsqueeze(0)
+
                 full_out_dir, base_fn, counter, subf, _ = folder_paths.get_save_image_path("monolith_faceswap_preview", folder_paths.get_temp_directory())
                 os.makedirs(full_out_dir, exist_ok=True)
                 preview_fn = f"{base_fn}_{counter:05}_.png"
                 Image.fromarray(mid_rgb).save(os.path.join(full_out_dir, preview_fn))
                 ui_images.append({"filename": preview_fn, "subfolder": subf, "type": "temp"})
 
-                if Types is not None and hasattr(InputImpl, "VideoFromComponents"):
-                    audio_dict = _extract_audio_from_file(video_input_path)
-                    fps_frac = Fraction(max(1, round(fps * 1000)), 1000)
-                    out_video = InputImpl.VideoFromComponents(
-                        Types.VideoComponents(images=frames_tensor, audio=audio_dict, frame_rate=fps_frac)
+                if Types is not None and _LazyRawVideoFromComponents is not None:
+                    out_video = _LazyRawVideoFromComponents(
+                        rgb_frames=rgb_frames,
+                        fps=fps,
+                        audio_source_path=video_input_path,
                     )
         elif has_component_video:
             comp = target_video.get_components()
@@ -435,13 +479,15 @@ class MonolithFaceSwap:
                 swapped_rgb.append(cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB))
                 pbar.update(1)
 
-            frames_tensor = torch.from_numpy(np.stack(swapped_rgb, axis=0)).to(dtype=torch.float32).div_(255.0)
+            mid_rgb = swapped_rgb[len(swapped_rgb) // 2]
             if out_image is None:
-                out_image = frames_tensor
+                out_image = torch.from_numpy(mid_rgb.astype(np.float32) / 255.0).unsqueeze(0)
 
-            if Types is not None and hasattr(InputImpl, "VideoFromComponents"):
-                comp_video = InputImpl.VideoFromComponents(
-                    Types.VideoComponents(images=frames_tensor, audio=comp.audio, frame_rate=comp.frame_rate)
+            if Types is not None and _LazyRawVideoFromComponents is not None:
+                comp_video = _LazyRawVideoFromComponents(
+                    rgb_frames=swapped_rgb,
+                    fps=float(comp.frame_rate) if comp.frame_rate else 25.0,
+                    audio_dict=comp.audio,
                 )
                 if save_video:
                     prefix = (filename_prefix or "video/ComfyUI").strip() or "video/ComfyUI"
@@ -454,7 +500,6 @@ class MonolithFaceSwap:
                     ui_videos.append({"filename": out_video_fn, "subfolder": subf, "type": "output"})
                 else:
                     out_video = comp_video
-                    mid_rgb = swapped_rgb[len(swapped_rgb) // 2]
                     full_out_dir, base_fn, counter, subf, _ = folder_paths.get_save_image_path("monolith_faceswap_preview", folder_paths.get_temp_directory())
                     os.makedirs(full_out_dir, exist_ok=True)
                     preview_fn = f"{base_fn}_{counter:05}_.png"
@@ -495,7 +540,6 @@ class MonolithFaceEnhancer:
     CATEGORY = "Monolith/FaceSwap"
 
     def enhance(self, image: torch.Tensor, enhance_model: str, blend: int):
-        import cv2
         FastFaceSwapEngine, create_box_mask = _get_engine_cls()
         engine = FastFaceSwapEngine(
             swap_model="inswapper_128_fp16",
@@ -505,6 +549,7 @@ class MonolithFaceEnhancer:
         if not engine.pre_check():
             raise RuntimeError(f"MonolithFaceEnhancer: Failed to load enhancer model '{enhance_model}'")
 
+        blend_alpha = min(max(blend / 100.0, 0.0), 1.0)
         out_frames = []
         for i in range(image.shape[0]):
             frame_bgr = (image[i].cpu().numpy() * 255.0).astype(np.uint8)[:, :, ::-1]
@@ -516,7 +561,6 @@ class MonolithFaceEnhancer:
 
             temp_frame = frame_bgr.copy()
             for face in faces:
-                unenhanced = temp_frame.copy()
                 enhance_size = engine.enhancer_info.get("size", (512, 512))
                 enhance_template = engine.enhancer_info.get("template", "ffhq_512")
 
@@ -527,10 +571,10 @@ class MonolithFaceEnhancer:
                 crop_size = (enhance_size[1], enhance_size[0])
                 box_mask = create_box_mask(crop_size, engine.mask_blur, [0, 0, 0, 0])
                 mask = np.minimum(box_mask, occ_mask).clip(0, 1)
+                if blend_alpha < 1.0:
+                    mask = mask * blend_alpha
 
-                pasted = engine.paste_back(temp_frame, enhanced, mask, affine)
-                face_enhancer_blend = 1.0 - (blend / 100.0)
-                temp_frame = cv2.addWeighted(unenhanced, face_enhancer_blend, pasted, 1.0 - face_enhancer_blend, 0)
+                temp_frame = engine.paste_back(temp_frame, enhanced, mask, affine)
 
             result_rgb = temp_frame[:, :, ::-1].astype(np.float32) / 255.0
             out_frames.append(torch.from_numpy(result_rgb))

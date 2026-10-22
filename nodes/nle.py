@@ -851,13 +851,22 @@ def execute_otio_timeline_render(
             and isinstance(val, InputImpl.VideoFromComponents)
             and hasattr(val, "get_components")
         ):
-            comp = val.get_components()
-            frames_np = np.clip(comp.images.detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
-            in_fps = float(comp.frame_rate) if comp.frame_rate else fps
-            raw_stdin_bytes = frames_np.tobytes()
-            raw_stdin_spec = (int(frames_np.shape[2]), int(frames_np.shape[1]), in_fps)
-            if comp.audio is not None and embedded_audio_fallback is None:
-                embedded_audio_fallback = _materialize_audio(comp.audio, "none", temp_dir, prefix="emb_audio")
+            if hasattr(val, "get_raw_rgb_stream"):
+                raw_stdin_bytes, w_in, h_in, in_fps, audio_src_path, audio_dict = val.get_raw_rgb_stream()
+                raw_stdin_spec = (int(w_in), int(h_in), float(in_fps) if in_fps else fps)
+                if embedded_audio_fallback is None:
+                    if audio_src_path and os.path.exists(audio_src_path):
+                        embedded_audio_fallback = audio_src_path
+                    elif audio_dict is not None:
+                        embedded_audio_fallback = _materialize_audio(audio_dict, "none", temp_dir, prefix="emb_audio")
+            else:
+                comp = val.get_components()
+                frames_np = np.clip(comp.images.detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+                in_fps = float(comp.frame_rate) if comp.frame_rate else fps
+                raw_stdin_bytes = frames_np.tobytes()
+                raw_stdin_spec = (int(frames_np.shape[2]), int(frames_np.shape[1]), in_fps)
+                if comp.audio is not None and embedded_audio_fallback is None:
+                    embedded_audio_fallback = _materialize_audio(comp.audio, "none", temp_dir, prefix="emb_audio")
             cmd_inputs.extend([
                 "-f", "rawvideo",
                 "-vcodec", "rawvideo",
